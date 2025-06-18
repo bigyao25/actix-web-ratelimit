@@ -1,0 +1,25 @@
+[package]
+name = "actix-web-ratelimit"
+version = "0.1.0"
+edition = "2024"
+authors = ["bigyao25 <rungroo@gmail.com>"]
+description = "A simple and highly customizable rate limiter for actix-web"
+license = "MIT"
+repository = "https://github.com/bigyao25/actix-web-ratelimit"
+readme = "README.md"
+keywords = ["ratelimit", "rate", "limit", "actix"]
+categories = ["security", "web-programming"]
+
+[dependencies]
+actix-web = "4"
+actix-service = "2"
+log = "0.4"
+futures-util = "0.3"
+dashmap = "6"
+redis = { version = "0.24", optional = true }
+chrono = { version = "0.4", optional = true }
+
+[features]
+default = []
+# default = ["redis"]
+redis = ["dep:redis", "chrono"]
