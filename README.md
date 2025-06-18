@@ -5,7 +5,7 @@ A simple and highly customizable rate limiting middleware for actix-web 4.
 [![Crates.io](https://img.shields.io/crates/v/actix-web-ratelimit.svg)](https://crates.io/crates/actix-web-ratelimit)
 [![Documentation](https://docs.rs/actix-web-ratelimit/badge.svg)](https://docs.rs/actix-web-ratelimit)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![build](https://img.shields.io/github/actions/workflow/status/bigyao25/actix-web-ratelimit/rust.yml?branch=main)](https://github.com/bigyao25/actix-web-ratelimit/actions/workflows/rust.yml)
+[![CI](https://img.shields.io/github/actions/workflow/status/bigyao25/actix-web-ratelimit/CI.yml?branch=main)](https://github.com/bigyao25/actix-web-ratelimit/actions/workflows/CI.yml)
 
 [中文文档](README-cn.md)
 
@@ -26,7 +26,7 @@ Add this to your `Cargo.toml`:
 [dependencies]
 actix-web-ratelimit = "0.1"
 
-# For Redis support
+# Or, for Redis support
 actix-web-ratelimit = { version = "0.1", features = ["redis"] }
 ```
 

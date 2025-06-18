@@ -19,7 +19,7 @@ Add this to your `Cargo.toml`:
 [dependencies]
 actix-web-ratelimit = "0.1"
 
-# For Redis support
+# Or, for Redis support
 actix-web-ratelimit = { version = "0.1", features = ["redis"] }
 ```
 
@@ -108,23 +108,23 @@ actix-web-ratelimit = { version = "0.1", features = [ "redis" ] }}
 then you can use it:
 
 ```rust, no_run
-#[cfg(feature = "redis")]
-use actix_web::{App, HttpServer, Responder, web};
-#[cfg(feature = "redis")]
-use actix_web_ratelimit::store::RedisStore;
-#[cfg(feature = "redis")]
-use actix_web_ratelimit::{RateLimit, config::RateLimitConfig};
-#[cfg(feature = "redis")]
-use std::sync::Arc;
-
-#[cfg(feature = "redis")]
-async fn index() -> impl Responder {
-    "Hello world!"
-}
-
-#[cfg(feature = "redis")]
-#[actix_web::main]
-async fn main() -> std::io::Result<()> {
+# #[cfg(feature = "redis")]
+# use actix_web::{App, HttpServer, Responder, web};
+# #[cfg(feature = "redis")]
+# use actix_web_ratelimit::store::RedisStore;
+# #[cfg(feature = "redis")]
+# use actix_web_ratelimit::{RateLimit, config::RateLimitConfig};
+# #[cfg(feature = "redis")]
+# use std::sync::Arc;
+#
+# #[cfg(feature = "redis")]
+# async fn index() -> impl Responder {
+#     "Hello world!"
+# }
+#
+# #[cfg(feature = "redis")]
+# #[actix_web::main]
+# async fn main() -> std::io::Result<()> {
     let store = Arc::new(
         RedisStore::new("redis://127.0.0.1/0")
             .expect("Failed to connect to Redis")
@@ -141,10 +141,10 @@ async fn main() -> std::io::Result<()> {
     .bind(("127.0.0.1", 8080))?
     .run()
     .await
-}
+# }
 
-#[cfg(not(feature = "redis"))]
-fn main() {}
+# #[cfg(not(feature = "redis"))]
+# fn main() {}
 
 ```
  */
