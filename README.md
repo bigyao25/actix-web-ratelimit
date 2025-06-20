@@ -35,9 +35,9 @@ actix-web-ratelimit = { version = "0.1", features = ["redis"] }
 ### Basic Usage with In-Memory Store
 
 ```rust
-    // configure the core indicator parameters of the middleware
+    // Configure rate limiting: allow 3 requests per 10-second window
     let config = RateLimitConfig::default().max_requests(3).window_secs(10);
-    // where are real-time request records stored
+    // Create in-memory store for tracking request timestamps
     let store = Arc::new(MemoryStore::new());
 
     HttpServer::new(move || {
@@ -58,7 +58,7 @@ actix-web-ratelimit = { version = "0.1", features = ["redis"] }
     let config = RateLimitConfig::default()
         .max_requests(3)
         .window_secs(10)
-        // Custom client identification. It is IP (realip_remote_addr) by default.
+        // Extract client identifier from req. It is IP (realip_remote_addr) by default.
         .id(|req| {
             req.headers()
                 .get("X-Client-Id")
@@ -66,7 +66,7 @@ actix-web-ratelimit = { version = "0.1", features = ["redis"] }
                 .unwrap_or("anonymous")
                 .to_string()
         })
-        // Custom response when rate limit exceeded. It returns a 429 response by default.
+        // Custom handler for rate limit exceeded. It returns a 429 response by default.
         .exceeded(|id, config, _req| {
             HttpResponse::TooManyRequests().body(format!(
                 "429 caused: client-id: {}, limit: {}req/{:?}",
@@ -94,6 +94,7 @@ then you can use it:
     let store = Arc::new(
         RedisStore::new("redis://127.0.0.1/0")
             .expect("Failed to connect to Redis")
+            // Custom prefix for Redis keys
             .with_prefix("myapp:ratelimit:"),
     );
     let config = RateLimitConfig::default().max_requests(3).window_secs(10);

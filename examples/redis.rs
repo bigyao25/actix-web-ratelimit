@@ -16,8 +16,10 @@ async fn index() -> impl Responder {
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let store = Arc::new(
+        // redis://[<username>][:<password>@]<hostname>[:port][/<db>]
         RedisStore::new("redis://127.0.0.1/0")
             .expect("Failed to connect to Redis")
+            // Custom prefix for Redis keys
             .with_prefix("myapp:ratelimit:"),
     );
     let config = RateLimitConfig::default().max_requests(3).window_secs(10);

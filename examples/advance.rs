@@ -14,16 +14,16 @@ async fn main() -> std::io::Result<()> {
     let config = RateLimitConfig::default()
         .max_requests(3)
         .window_secs(10)
+        // Extract client identifier from req
         .id(|req| {
-            // Custom client identification
             req.headers()
                 .get("X-Client-Id")
                 .and_then(|h| h.to_str().ok())
                 .unwrap_or("anonymous")
                 .to_string()
         })
+        // Custom handler for rate limit exceeded
         .exceeded(|id, config, _req| {
-            // Custom rate limit exceeded response
             HttpResponse::TooManyRequests().body(format!(
                 "429 caused: client-id: {}, limit: {}req/{:?}",
                 id, config.max_requests, config.window_secs

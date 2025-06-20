@@ -9,16 +9,27 @@ async fn index() -> impl Responder {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    // Configure the core indicator parameters of the middleware.
+    // Configure rate limiting: allow 3 requests per 10-second window
     let config = RateLimitConfig::default().max_requests(3).window_secs(10);
-    // Where are real-time request records stored.
+
+    // Create in-memory store for tracking request timestamps
+    // Using Arc for shared ownership across worker threads
     let store = Arc::new(MemoryStore::new());
+
+    println!("🚀 Starting server at http://127.0.0.1:8080");
+    println!(
+        "📊 Rate limit: {} requests per {} seconds",
+        config.max_requests,
+        config.window_secs.as_secs()
+    );
+    println!("🧪 Test with: curl http://localhost:8080/");
 
     HttpServer::new(move || {
         App::new()
-            // Create and register the rate limit middleware.
-            // If you don't want to clone the config and store, you can move the defination of
-            // config and store into this closure.
+            // Apply rate limiting middleware to all routes
+            // Note: We clone config and store for each worker thread
+            // This is necessary because HttpServer creates multiple worker threads,
+            // and each needs its own reference to the shared(same) config and store
             .wrap(RateLimit::new(config.clone(), store.clone()))
             .route("/", web::get().to(index))
     })

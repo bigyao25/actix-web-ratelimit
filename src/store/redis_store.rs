@@ -5,18 +5,73 @@ mod redis_store_impl {
     use redis::{Client, RedisError, RedisResult};
     use std::sync::Arc;
 
+    /// Default prefix for Redis keys used by the rate limiter
     const REDIS_PREFIX: &str = "rate_limit:";
 
-    /// Implement of RateLimitStore base on redis-rs.
+    /// Redis-based implementation of [`RateLimitStore`] using Redis Sorted Sets.
+    ///
+    /// This store uses Redis Sorted Sets to track request timestamps for each client.
+    /// It's suitable for distributed applications where rate limiting data needs
+    /// to be shared across multiple instances.
+    ///
+    /// # Features
+    ///
+    /// - **Distributed**: Share rate limiting data across multiple application instances
+    /// - **Persistent**: Data survives application restarts
+    /// - **Scalable**: Can handle high throughput with proper Redis configuration
+    /// - **Automatic cleanup**: Uses Redis expiration to clean up old data
+    ///
+    /// # Redis Data Structure
+    ///
+    /// Uses Redis Sorted Sets where:
+    /// - Key: `{prefix}{client_id}`
+    /// - Score: Request timestamp in milliseconds
+    /// - Member: Same as score (timestamp)
+    ///
+    /// # Fallback Strategy
+    ///
+    /// If Redis operations fail, the store falls back to allowing requests
+    /// to prevent service disruption.
     pub struct RedisStore {
+        /// Redis client for database operations
         client: Client,
+        /// Key prefix for namespacing rate limit data
         prefix: String,
     }
 
     impl RedisStore {
-        /// Create a new [`crate::store::RedisStore`] instance.
+        /// Creates a new [`RedisStore`] instance and tests the connection.
         ///
-        /// The URL format is `redis://[<username>][:<password>@]<hostname>[:port][/<db>]`
+        /// # Arguments
+        ///
+        /// * `redis_url` - Redis connection URL
+        ///
+        /// # URL Format
+        ///
+        /// `redis://[<username>][:<password>@]<hostname>[:port][/<db>]`
+        ///
+        /// # Examples
+        ///
+        /// ```rust,no_run
+        /// # #[cfg(feature = "redis")]
+        /// # {
+        /// use actix_web_ratelimit::store::RedisStore;
+        ///
+        /// // Basic connection
+        /// let store = RedisStore::new("redis://127.0.0.1/")?;
+        ///
+        /// // With authentication and specific database
+        /// let store = RedisStore::new("redis://:password@127.0.0.1:6379/1")?;
+        /// # }
+        /// # Ok::<(), redis::RedisError>(())
+        /// ```
+        ///
+        /// # Errors
+        ///
+        /// Returns [`RedisError`] if:
+        /// - URL format is invalid
+        /// - Cannot connect to Redis server
+        /// - PING command fails
         pub fn new(redis_url: &str) -> Result<Self, RedisError> {
             let client = Client::open(redis_url)?;
             let mut conn = client.get_connection()?;
@@ -28,17 +83,69 @@ mod redis_store_impl {
             })
         }
 
+        /// Sets a custom prefix for Redis keys.
+        ///
+        /// This is useful for namespacing when multiple applications
+        /// or environments share the same Redis instance.
+        ///
+        /// # Arguments
+        ///
+        /// * `prefix` - Custom prefix for Redis keys
+        ///
+        /// # Example
+        ///
+        /// ```rust,no_run
+        /// # #[cfg(feature = "redis")]
+        /// # {
+        /// use actix_web_ratelimit::store::RedisStore;
+        ///
+        /// let store = RedisStore::new("redis://127.0.0.1/")?
+        ///     .with_prefix("myapp:ratelimit:");
+        /// # }
+        /// # Ok::<(), redis::RedisError>(())
+        /// ```
         pub fn with_prefix(mut self, prefix: &str) -> Self {
             self.prefix = prefix.to_string();
             self
         }
 
+        /// Generates the full Redis key by combining prefix and client identifier.
+        ///
+        /// # Arguments
+        ///
+        /// * `key` - Client identifier (typically IP address)
+        ///
+        /// # Returns
+        ///
+        /// Full Redis key string
         fn get_key(&self, key: &str) -> String {
             format!("{}{}", self.prefix, key)
         }
     }
 
     impl RateLimitStore for RedisStore {
+        /// Checks if the client has exceeded the rate limit using Redis Sorted Sets.
+        ///
+        /// This method implements a distributed sliding window algorithm:
+        /// 1. Removes expired request timestamps from the sorted set
+        /// 2. Counts remaining requests in the time window
+        /// 3. Checks if count exceeds the configured limit
+        /// 4. If not exceeded, adds current timestamp to the set
+        /// 5. Sets expiration time for automatic cleanup
+        ///
+        /// # Fallback Strategy
+        ///
+        /// If any Redis operation fails, the method returns `false` (allow request)
+        /// to prevent service disruption. Errors are logged for monitoring.
+        ///
+        /// # Arguments
+        ///
+        /// * `key` - Client identifier (typically IP address)
+        /// * `config` - Rate limiting configuration
+        ///
+        /// # Returns
+        ///
+        /// `true` if the client has exceeded the rate limit, `false` otherwise
         fn is_limited(&self, key: &str, config: &RateLimitConfig) -> bool {
             use std::i32;
 
@@ -53,16 +160,16 @@ mod redis_store_impl {
                 Ok(conn) => conn,
                 Err(err) => {
                     error!("Failed to get Redis connection: {}", err);
-                    // 连接失败时，不限制请求（降级策略）
+                    // Fallback: allow request when connection fails (graceful degradation)
                     return false;
                 }
             };
 
-            // 使用 Redis Sorted Set 存储请求时间戳
+            // Use Redis Sorted Set to store request timestamps
             let now = chrono::Utc::now().timestamp_millis() as f64;
             let window_start = now - config.window_secs.as_millis() as f64;
 
-            // 1. 移除超过时间窗口的请求
+            // Step 1: Remove expired requests outside the time window
             let remove_result: redis::RedisResult<i32> = redis::cmd("ZREMRANGEBYSCORE")
                 .arg(&redis_key)
                 .arg("-inf")
@@ -73,7 +180,7 @@ mod redis_store_impl {
                 error!("Failed to remove old entries: {}", err);
             }
 
-            // 2. 计算当前时间窗口内的请求数量
+            // Step 2: Count current requests within the time window
             let count_result: redis::RedisResult<usize> = redis::cmd("ZCOUNT")
                 .arg(&redis_key)
                 .arg(window_start)
@@ -84,12 +191,12 @@ mod redis_store_impl {
                 Ok(c) => c,
                 Err(err) => {
                     error!("Redis error on ZCOUNT: {}", err);
-                    // 发生错误时，不限制请求（降级策略）
+                    // Fallback: allow request when count fails (graceful degradation)
                     return false;
                 }
             };
 
-            if count >= config.max_requests {
+            if count > config.max_requests {
                 warn!(
                     "Rate limit exceeded for key({}): count({}) >= max_req({})",
                     key, count, config.max_requests
@@ -97,7 +204,7 @@ mod redis_store_impl {
                 return true;
             }
 
-            // 3. 添加新的请求记录
+            // Step 3: Add current request timestamp
             let add_result: redis::RedisResult<()> = redis::cmd("ZADD")
                 .arg(&redis_key)
                 .arg(now)
@@ -108,7 +215,7 @@ mod redis_store_impl {
                 error!("Failed to add new entry: {}", err);
             }
 
-            // 4. 设置过期时间，稍微长于窗口时间，以确保清理
+            // Step 4: Set expiration time slightly longer than window for cleanup
             let expiry = config.window_secs.as_secs() + 10;
             let expire_result: redis::RedisResult<()> = redis::cmd("EXPIRE")
                 .arg(&redis_key)
@@ -123,7 +230,12 @@ mod redis_store_impl {
         }
     }
 
+    /// Implementation of [`RateLimitStore`] for `Arc<RedisStore>` to enable shared ownership.
+    ///
+    /// This allows the same `RedisStore` instance to be used across multiple threads
+    /// and middleware instances safely.
     impl RateLimitStore for Arc<RedisStore> {
+        /// Delegates to the underlying `RedisStore` implementation.
         fn is_limited(&self, key: &str, config: &RateLimitConfig) -> bool {
             (**self).is_limited(key, config)
         }
