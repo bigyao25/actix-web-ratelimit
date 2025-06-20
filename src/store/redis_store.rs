@@ -198,7 +198,7 @@ mod redis_store_impl {
 
             if count > config.max_requests {
                 warn!(
-                    "Rate limit exceeded for key({}): count({}) >= max_req({})",
+                    "Rate limit exceeded for key({}): count({}) > max_req({})",
                     key, count, config.max_requests
                 );
                 return true;
