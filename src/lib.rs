@@ -1,6 +1,8 @@
 /*!
 A simple and highly customizable rate limiting middleware for actix-web 4.
 
+For complete documentation and examples, visit the [GitHub repository](https://github.com/bigyao25/actix-web-ratelimit).
+
 ## Features
 
 - **actix-web 4 Compatible**: Built specifically for actix-web 4
@@ -102,13 +104,15 @@ actix-web-ratelimit = { version = "0.1", features = ["redis"] }
 ```
 
 ### Redis Store
-set feature `redis` enable first:
+
+First, enable the `redis` feature:
 
 ```toml
-actix-web-ratelimit = { version = "0.1", features = [ "redis" ] }
+[dependencies]
+actix-web-ratelimit = { version = "0.1", features = ["redis"] }
 ```
 
-then you can use it:
+Then you can use Redis as the storage backend:
 
 ```rust, no_run
 # #[cfg(feature = "redis")]
@@ -150,6 +154,32 @@ then you can use it:
 # fn main() {}
 
 ```
+
+## Storage Backends
+
+This crate provides two built-in storage implementations:
+
+- [`store::MemoryStore`] - In-memory storage using [`dashmap::DashMap`]
+- [`store::RedisStore`] - Distributed storage using Redis (requires `redis` feature)
+
+For custom storage backends, implement the [`store::RateLimitStore`] trait.
+
+## Configuration
+
+Rate limiting behavior is controlled by [`config::RateLimitConfig`]:
+
+- `max_requests` - Maximum requests allowed within the time window
+- `window_secs` - Duration of the sliding time window in seconds
+- `get_id` - Function to extract client identifier from requests
+- `on_exceed` - Function called when rate limit is exceeded
+
+## Related Resources
+
+- [Crates.io](https://crates.io/crates/actix-web-ratelimit) - Package information
+- [Docs.rs](https://docs.rs/actix-web-ratelimit) - API documentation
+- [GitHub](https://github.com/bigyao25/actix-web-ratelimit) - Source code and issues
+- [Examples](https://github.com/bigyao25/actix-web-ratelimit/tree/main/examples) - Usage examples
+
  */
 pub mod config;
 pub mod store;
