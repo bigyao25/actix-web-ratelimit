@@ -33,10 +33,7 @@ use std::time::Duration;
 ///     .exceeded(|id, _config, _req| {
 ///         // Custom rate limit exceeded response
 ///         HttpResponse::TooManyRequests()
-///             .json(serde_json::json!({
-///                 "error": "Rate limit exceeded",
-///                 "client_id": id
-///             }))
+///             .body(format!("Rate limit exceeded for client: {}", id))
 ///     });
 /// ```
 #[derive(Clone)]
@@ -153,14 +150,15 @@ impl RateLimitConfig {
     ///             .to_string()
     ///     });
     ///
-    /// // Rate limit by user ID from authentication
+    /// // Rate limit by custom header
     /// let config = RateLimitConfig::default()
     ///     .id(|req| {
-    ///         // Extract user ID from authentication middleware
-    ///         req.extensions()
-    ///             .get::<String>()
-    ///             .cloned()
-    ///             .unwrap_or_else(|| "guest".to_string())
+    ///         // Extract user ID from custom header
+    ///         req.headers()
+    ///             .get("X-User-ID")
+    ///             .and_then(|h| h.to_str().ok())
+    ///             .unwrap_or("guest")
+    ///             .to_string()
     ///     });
     /// ```
     pub fn id(mut self, fn_id: fn(req: &ServiceRequest) -> String) -> Self {
@@ -180,19 +178,19 @@ impl RateLimitConfig {
     /// # Examples
     ///
     /// ```rust
-    /// use actix_web::{HttpResponse, web::Json};
+    /// use actix_web::HttpResponse;
     /// use actix_web_ratelimit::config::RateLimitConfig;
     ///
-    /// // JSON error response
+    /// // Custom error response with details
     /// let config = RateLimitConfig::default()
     ///     .exceeded(|id, config, _req| {
     ///         HttpResponse::TooManyRequests()
-    ///             .json(serde_json::json!({
-    ///                 "error": "Rate limit exceeded",
-    ///                 "client_id": id,
-    ///                 "limit": config.max_requests,
-    ///                 "window_secs": config.window_secs.as_secs()
-    ///             }))
+    ///             .body(format!(
+    ///                 "Rate limit exceeded for client: {}. Limit: {} requests per {} seconds.",
+    ///                 id,
+    ///                 config.max_requests,
+    ///                 config.window_secs.as_secs()
+    ///             ))
     ///     });
     ///
     /// // Custom headers and retry-after

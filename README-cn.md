@@ -5,6 +5,7 @@
 [![Crates.io](https://img.shields.io/crates/v/actix-web-ratelimit.svg)](https://crates.io/crates/actix-web-ratelimit)
 [![Documentation](https://docs.rs/actix-web-ratelimit/badge.svg)](https://docs.rs/actix-web-ratelimit)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![CI](https://img.shields.io/github/actions/workflow/status/bigyao25/actix-web-ratelimit/CI.yml?branch=main)](https://github.com/bigyao25/actix-web-ratelimit/actions/workflows/CI.yml)
 
 [English Documentation](README.md)
 
@@ -12,7 +13,7 @@
 
 - **兼容 actix-web 4**: 专为 actix-web 4 构建
 - **简单易用**: 最少配置即可使用
-- **可插拔存储**: 支持内存和 Redis 存储后端
+- **可扩展存储**: 易于创建自定义存储，已提供内存存储和 Redis 存储
 - **高性能**: 高效的滑动窗口算法
 - **可定制**: 支持自定义客户端识别和限流处理
 - **线程安全**: 使用 DashMap 实现并发请求处理
@@ -25,7 +26,7 @@
 [dependencies]
 actix-web-ratelimit = "0.1"
 
-# 启用 Redis 支持
+# 或者，启用 Redis 支持
 actix-web-ratelimit = { version = "0.1", features = ["redis"] }
 ```
 
@@ -34,19 +35,44 @@ actix-web-ratelimit = { version = "0.1", features = ["redis"] }
 ### 基础用法（内存存储）
 
 ```rust
-use actix_web::{web, App, HttpServer, Responder};
-use actix_web_ratelimit::{RateLimit, RateLimitConfig, store::MemoryStore};
+    // 配置限流：10 秒窗口内允许 3 个请求
+    let config = RateLimitConfig::default().max_requests(3).window_secs(10);
+    // 创建内存存储用于跟踪请求时间戳
+    let store = Arc::new(MemoryStore::new());
 
-async fn index() -> impl Responder {
-    "Hello world!"
-}
+    HttpServer::new(move || {
+        App::new()
+            // 创建并注册限流中间件
+            .wrap(RateLimit::new(config.clone(), store.clone()))
+            .route("/", web::get().to(index))
+    })
+    .bind(("127.0.0.1", 8080))?
+    .run()
+    .await
+```
 
-#[actix_web::main]
-async fn main() -> std::io::Result<()> {
-    let store = MemoryStore::new();
+### 高级配置
+
+```rust
+    let store = Arc::new(MemoryStore::new());
     let config = RateLimitConfig::default()
-        .max_requests(10)
-        .window_secs(60);
+        .max_requests(3)
+        .window_secs(10)
+        // 从请求中提取客户端标识符。默认为 IP (realip_remote_addr)。
+        .id(|req| {
+            req.headers()
+                .get("X-Client-Id")
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or("anonymous")
+                .to_string()
+        })
+        // 限流超出时的自定义处理器。默认返回 429 响应。
+        .exceeded(|id, config, _req| {
+            HttpResponse::TooManyRequests().body(format!(
+                "429 caused: client-id: {}, limit: {}req/{:?}",
+                id, config.max_requests, config.window_secs
+            ))
+        });
 
     HttpServer::new(move || {
         App::new()
@@ -56,56 +82,32 @@ async fn main() -> std::io::Result<()> {
     .bind(("127.0.0.1", 8080))?
     .run()
     .await
-}
-```
-
-### 高级配置
-
-```rust
-use actix_web::{HttpResponse, web};
-use actix_web_ratelimit::{RateLimit, RateLimitConfig, store::MemoryStore};
-
-let store = MemoryStore::new();
-let config = RateLimitConfig::default()
-    .max_requests(100)
-    .window_secs(3600)
-    .id(|req| {
-        // 自定义客户端识别
-        req.headers()
-            .get("X-API-Key")
-            .and_then(|h| h.to_str().ok())
-            .unwrap_or("anonymous")
-            .to_string()
-    })
-    .exceeded(|_id, _config, _req| {
-        // 自定义限流超出响应
-        HttpResponse::TooManyRequests()
-            .json(serde_json::json!({
-                "error": "请求过于频繁",
-                "retry_after": 60
-            }))
-    });
-
-App::new().wrap(RateLimit::new(config, store))
 ```
 
 ### Redis 存储
 
+首先启用 `redis` 特性：
+```toml
+actix-web-ratelimit = { version = "0.1", features = [ "redis" ] }
+```
+然后你可以使用它：
 ```rust
-use actix_web_ratelimit::{RateLimit, RateLimitConfig, store::RedisStore};
+    let store = Arc::new(
+        RedisStore::new("redis://127.0.0.1/0")
+            .expect("连接 Redis 失败")
+            // Redis 键的自定义前缀
+            .with_prefix("myapp:ratelimit:"),
+    );
+    let config = RateLimitConfig::default().max_requests(3).window_secs(10);
 
-#[cfg(feature = "redis")]
-{
-    let store = RedisStore::new("redis://127.0.0.1/")
-        .expect("连接 Redis 失败")
-        .with_prefix("myapp:");
-    
-    let config = RateLimitConfig::default()
-        .max_requests(1000)
-        .window_secs(3600);
-
-    App::new().wrap(RateLimit::new(config, store))
-}
+    HttpServer::new(move || {
+        App::new()
+            .wrap(RateLimit::new(config.clone(), store.clone()))
+            .route("/", web::get().to(index))
+    })
+    .bind(("127.0.0.1", 8080))?
+    .run()
+    .await
 ```
 
 ## 配置选项
@@ -157,7 +159,7 @@ cargo run --example simple
 curl http://localhost:8080/
 
 # 通过多次请求触发限流
-for i in {1..15}; do curl http://localhost:8080/; done
+for i in {1..5}; do echo "$(curl -s http://localhost:8080)\r"; done
 ```
 
 ## 特性标志
