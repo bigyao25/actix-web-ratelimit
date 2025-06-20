@@ -20,7 +20,6 @@ async fn main() -> std::io::Result<()> {
             .expect("Failed to connect to Redis")
             .with_prefix("myapp:ratelimit:"),
     );
-
     let config = RateLimitConfig::default().max_requests(3).window_secs(10);
 
     HttpServer::new(move || {

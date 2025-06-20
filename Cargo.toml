@@ -20,6 +20,6 @@ redis = { version = "0.24", optional = true }
 chrono = { version = "0.4", optional = true }
 
 [features]
-default = []
-# default = ["redis"]
+# default = []
+default = ["redis"]
 redis = ["dep:redis", "chrono"]

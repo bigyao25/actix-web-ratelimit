@@ -38,11 +38,14 @@ actix-web-ratelimit = { version = "0.1", features = ["redis"] }
 #
 # #[actix_web::main]
 # async fn main() -> std::io::Result<()> {
+    // Configure the core indicator parameters of the middleware.
     let config = RateLimitConfig::default().max_requests(3).window_secs(10);
+    // Where are real-time request records stored.
     let store = Arc::new(MemoryStore::new());
 
     HttpServer::new(move || {
         App::new()
+            // Create and register the rate limit middleware.
             .wrap(RateLimit::new(config.clone(), store.clone()))
             .route("/", web::get().to(index))
     })
@@ -71,16 +74,16 @@ actix-web-ratelimit = { version = "0.1", features = ["redis"] }
     let config = RateLimitConfig::default()
         .max_requests(3)
         .window_secs(10)
+        // Custom client identification. It is IP (realip_remote_addr) by default.
         .id(|req| {
-            // Custom client identification
             req.headers()
                 .get("X-Client-Id")
                 .and_then(|h| h.to_str().ok())
                 .unwrap_or("anonymous")
                 .to_string()
         })
+        // Custom response when rate limit exceeded. It returns a 429 response by default.
         .exceeded(|id, config, _req| {
-            // Custom rate limit exceeded response
             HttpResponse::TooManyRequests().body(format!(
                 "429 caused: client-id: {}, limit: {}req/{:?}",
                 id, config.max_requests, config.window_secs
@@ -130,7 +133,6 @@ then you can use it:
             .expect("Failed to connect to Redis")
             .with_prefix("myapp:ratelimit:"),
     );
-
     let config = RateLimitConfig::default().max_requests(3).window_secs(10);
 
     HttpServer::new(move || {

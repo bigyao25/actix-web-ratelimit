@@ -7,12 +7,16 @@ mod redis_store_impl {
 
     const REDIS_PREFIX: &str = "rate_limit:";
 
+    /// Implement of RateLimitStore base on redis-rs.
     pub struct RedisStore {
         client: Client,
         prefix: String,
     }
 
     impl RedisStore {
+        /// Create a new [`crate::store::RedisStore`] instance.
+        ///
+        /// The URL format is `redis://[<username>][:<password>@]<hostname>[:port][/<db>]`
         pub fn new(redis_url: &str) -> Result<Self, RedisError> {
             let client = Client::open(redis_url)?;
             let mut conn = client.get_connection()?;

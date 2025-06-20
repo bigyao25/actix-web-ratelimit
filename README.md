@@ -13,7 +13,7 @@ A simple and highly customizable rate limiting middleware for actix-web 4.
 
 - **actix-web 4 Compatible**: Built specifically for actix-web 4
 - **Simple & Easy to Use**: Minimal configuration required
-- **Pluggable Storage**: Support for in-memory and Redis storage backends
+- **Expandable Store**: easy to create your own store, In-Memory store and Redis store have been provided
 - **High Performance**: Efficient sliding window algorithm
 - **Customizable**: Custom client identification and rate limit exceeded handlers
 - **Thread Safe**: Concurrent request handling with DashMap
@@ -35,11 +35,14 @@ actix-web-ratelimit = { version = "0.1", features = ["redis"] }
 ### Basic Usage with In-Memory Store
 
 ```rust
+    // configure the core indicator parameters of the middleware
     let config = RateLimitConfig::default().max_requests(3).window_secs(10);
+    // where are real-time request records stored
     let store = Arc::new(MemoryStore::new());
 
     HttpServer::new(move || {
         App::new()
+            // create and register the rate limit middleware
             .wrap(RateLimit::new(config.clone(), store.clone()))
             .route("/", web::get().to(index))
     })
@@ -55,15 +58,15 @@ actix-web-ratelimit = { version = "0.1", features = ["redis"] }
     let config = RateLimitConfig::default()
         .max_requests(3)
         .window_secs(10)
+        // Custom client identification. It is IP (realip_remote_addr) by default.
         .id(|req| {
-            // custom client identification
             req.headers()
                 .get("X-Client-Id")
                 .and_then(|h| h.to_str().ok())
                 .unwrap_or("anonymous")
                 .to_string()
         })
-            // custom response when rate limit exceeded
+        // Custom response when rate limit exceeded. It returns a 429 response by default.
         .exceeded(|id, config, _req| {
             HttpResponse::TooManyRequests().body(format!(
                 "429 caused: client-id: {}, limit: {}req/{:?}",
@@ -93,7 +96,6 @@ then you can use it:
             .expect("Failed to connect to Redis")
             .with_prefix("myapp:ratelimit:"),
     );
-
     let config = RateLimitConfig::default().max_requests(3).window_secs(10);
 
     HttpServer::new(move || {
