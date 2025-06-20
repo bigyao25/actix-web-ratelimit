@@ -1,6 +1,6 @@
 [package]
 name = "actix-web-ratelimit"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 authors = ["bigyao25 <rungroo@gmail.com>"]
 description = "A simple and highly customizable rate limiter for actix-web 4"
