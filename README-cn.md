@@ -87,10 +87,13 @@ actix-web-ratelimit = { version = "0.1", features = ["redis"] }
 ### Redis 存储
 
 首先启用 `redis` 特性：
+
 ```toml
 actix-web-ratelimit = { version = "0.1", features = [ "redis" ] }
 ```
+
 然后你可以使用它：
+
 ```rust
     let store = Arc::new(
         RedisStore::new("redis://127.0.0.1/0")
@@ -115,7 +118,7 @@ actix-web-ratelimit = { version = "0.1", features = [ "redis" ] }
 ### RateLimitConfig
 
 | 方法 | 描述 | 默认值 |
-|------|------|--------|
+| ------ | ------ | -------- |
 | `max_requests(usize)` | 时间窗口内最大请求数 | 10 |
 | `window_secs(u64)` | 时间窗口（秒） | 100 |
 | `id(fn)` | 客户端识别函数 | IP 地址 |
@@ -124,11 +127,13 @@ actix-web-ratelimit = { version = "0.1", features = [ "redis" ] }
 ### 存储后端
 
 #### MemoryStore
+
 - **优点**: 快速，无外部依赖
 - **缺点**: 无法分布式，重启后数据丢失
 - **适用场景**: 单实例应用
 
 #### RedisStore (需要 `redis` 特性)
+
 - **优点**: 分布式，持久化，可扩展
 - **缺点**: 需要 Redis 服务器
 - **适用场景**: 多实例应用
@@ -162,7 +167,7 @@ curl http://localhost:8080/
 for i in {1..5}; do echo "$(curl -s http://localhost:8080)\r"; done
 ```
 
-## 特性标志
+## [features]
 
 - `redis`: 启用 Redis 存储后端支持
 

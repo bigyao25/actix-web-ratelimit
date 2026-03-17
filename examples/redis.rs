@@ -15,6 +15,7 @@ async fn index() -> impl Responder {
 #[cfg(feature = "redis")]
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+    let config = RateLimitConfig::default().max_requests(3).window_secs(10);
     let store = Arc::new(
         // redis://[<username>][:<password>@]<hostname>[:port][/<db>]
         RedisStore::new("redis://127.0.0.1/0")
@@ -22,7 +23,14 @@ async fn main() -> std::io::Result<()> {
             // Custom prefix for Redis keys
             .with_prefix("myapp:ratelimit:"),
     );
-    let config = RateLimitConfig::default().max_requests(3).window_secs(10);
+
+    println!("🚀 Starting REDIS server at http://127.0.0.1:8080");
+    println!(
+        "📊 Rate limit: {} requests per {} seconds",
+        config.max_requests,
+        config.window_secs.as_secs()
+    );
+    println!("🧪 Test with: curl http://localhost:8080/");
 
     HttpServer::new(move || {
         App::new()

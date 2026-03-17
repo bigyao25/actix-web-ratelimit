@@ -85,11 +85,15 @@ actix-web-ratelimit = { version = "0.1", features = ["redis"] }
 ```
 
 ### Redis Store
+
 first set feature `redis` enable:
+
 ```toml
 actix-web-ratelimit = { version = "0.1", features = [ "redis" ] }
 ```
+
 then you can use it:
+
 ```rust
     let store = Arc::new(
         RedisStore::new("redis://127.0.0.1/0")
@@ -114,7 +118,7 @@ then you can use it:
 ### RateLimitConfig
 
 | Method | Description | Default |
-|--------|-------------|---------|
+| ------ | ------ | -------- |
 | `max_requests(usize)` | Maximum requests per window | 10 |
 | `window_secs(u64)` | Time window in seconds | 100 |
 | `id(fn)` | Client identification function | IP address |
@@ -123,11 +127,13 @@ then you can use it:
 ### Storage Backends
 
 #### MemoryStore
+
 - **Pros**: Fast, no external dependencies
 - **Cons**: Not distributed, data lost on restart
 - **Use case**: Single instance applications
 
 #### RedisStore (requires `redis` feature)
+
 - **Pros**: Distributed, persistent, scalable
 - **Cons**: Requires Redis server
 - **Use case**: Multi-instance applications
@@ -161,7 +167,7 @@ curl http://localhost:8080/
 for i in {1..5}; do echo "$(curl -s http://localhost:8080)\r"; done
 ```
 
-## Features
+## [features]
 
 - `redis`: Enables Redis storage backend support
 

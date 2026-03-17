@@ -10,7 +10,6 @@ async fn index() -> impl Responder {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    let store = Arc::new(MemoryStore::new());
     let config = RateLimitConfig::default()
         .max_requests(3)
         .window_secs(10)
@@ -29,6 +28,15 @@ async fn main() -> std::io::Result<()> {
                 id, config.max_requests, config.window_secs
             ))
         });
+    let store = Arc::new(MemoryStore::new());
+
+    println!("🚀 Starting ADVANCE server at http://127.0.0.1:8080");
+    println!(
+        "📊 Rate limit: {} requests per {} seconds",
+        config.max_requests,
+        config.window_secs.as_secs()
+    );
+    println!("🧪 Test with: curl http://localhost:8080/");
 
     HttpServer::new(move || {
         App::new()
