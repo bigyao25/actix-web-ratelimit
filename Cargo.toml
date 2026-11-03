@@ -16,7 +16,7 @@ actix-service = "2"
 log = "0.4"
 futures-util = "0.3"
 dashmap = "6"
-redis = { version = "0.32", optional = true }
+redis = { version = "1.8", optional = true }
 chrono = { version = "0.4", optional = true }
 
 [features]
