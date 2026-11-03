@@ -2,21 +2,77 @@ name: CI
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
 
 jobs:
-  build:
-
+  format:
+    name: Check formatting
     runs-on: ubuntu-latest
-
+    timeout-minutes: 10
     steps:
-    - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  build:
+    name: Lint and test (${{ matrix.features }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        features: [default, no-default]
+        include:
+          - features: default
+            cargo-flags: ""
+            redis-image: redis:7-alpine
+          - features: no-default
+            cargo-flags: --no-default-features
+            redis-image: ""
+    services:
+      redis:
+        # An empty image skips service startup for the no-default matrix entry.
+        image: ${{ matrix.redis-image }}
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.features }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Check Clippy warnings
+        run: cargo clippy --locked --all-targets ${{ matrix.cargo-flags }} -- -D warnings
+      - name: Run tests for all targets
+        run: cargo test --locked --all-targets ${{ matrix.cargo-flags }}
+      # --all-targets excludes doctests, so run them explicitly.
+      - name: Test documentation examples
+        run: cargo test --locked --doc ${{ matrix.cargo-flags }}

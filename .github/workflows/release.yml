@@ -1,0 +1,81 @@
+name: Publish to crates.io
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Expected Cargo.toml version (for example, 0.1.2)"
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: crates-io-release
+  cancel-in-progress: false
+
+jobs:
+  authorize:
+    name: Verify repository administrator
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check branch and administrator permissions
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const repository = await github.rest.repos.get({ owner, repo });
+            if (context.ref !== `refs/heads/${repository.data.default_branch}`) {
+              throw new Error('Releases must run from the default branch.');
+            }
+            // Check both the original actor and the actor requesting a rerun.
+            const actors = new Set([context.actor, process.env.GITHUB_TRIGGERING_ACTOR]);
+            for (const username of actors) {
+              if (!username) throw new Error('Unable to identify the triggering actor.');
+              const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
+                owner, repo, username,
+              });
+              if (data.permission !== 'admin') {
+                throw new Error(`Only repository administrators may publish: ${username}`);
+              }
+            }
+
+  publish:
+    name: Test and publish
+    needs: authorize
+    runs-on: ubuntu-latest
+    environment: crates-io
+    permissions:
+      contents: read
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify requested version
+        env:
+          EXPECTED_VERSION: ${{ inputs.version }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import tomllib
+          with open('Cargo.toml', 'rb') as manifest:
+              version = tomllib.load(manifest)['package']['version']
+          expected = os.environ['EXPECTED_VERSION']
+          if version != expected:
+              raise SystemExit(f'Version mismatch: Cargo.toml={version}, requested={expected}')
+          PY
+      - name: Test all features
+        run: cargo test --locked --all-features
+      - name: Test without default features
+        run: cargo test --locked --no-default-features
+      - name: Verify package
+        run: cargo publish --locked --dry-run
+      - name: Publish to crates.io
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
