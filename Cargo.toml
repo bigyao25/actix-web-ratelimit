@@ -11,7 +11,7 @@ keywords = ["ratelimit", "rate", "limit", "actix", "actix-web"]
 categories = ["security", "web-programming"]
 
 [dependencies]
-actix-web = "4"
+actix-web = { version = "4", default-features = false, features = ["macros"] }
 actix-service = "2"
 log = "0.4"
 futures-util = "0.3"

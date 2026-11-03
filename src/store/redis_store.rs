@@ -147,8 +147,6 @@ mod redis_store_impl {
         ///
         /// `true` if the client has exceeded the rate limit, `false` otherwise
         fn is_limited(&self, key: &str, config: &RateLimitConfig) -> bool {
-            use std::i32;
-
             let redis_key = self.get_key(key);
 
             debug!(
