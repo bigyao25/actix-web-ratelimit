@@ -1,244 +1,159 @@
-#[cfg(feature = "redis")]
-mod redis_store_impl {
-    use crate::{config::RateLimitConfig, store::RateLimitStore};
-    use log::{debug, error, warn};
-    use redis::{Client, RedisError, RedisResult};
-    use std::sync::Arc;
+use crate::{
+    config::RateLimitConfig,
+    store::{RateLimitStore, StoreError},
+};
+use futures_util::future::BoxFuture;
+use redis::{
+    Client, RedisError, RedisResult, Script,
+    aio::{ConnectionManager, ConnectionManagerConfig},
+};
+use std::{io, sync::LazyLock, time::Duration};
 
-    /// Default prefix for Redis keys used by the rate limiter
-    const REDIS_PREFIX: &str = "rate_limit:";
+static SCRIPT: LazyLock<Script> = LazyLock::new(|| Script::new(include_str!("sliding_window.lua")));
 
-    /// Redis-based implementation of [`RateLimitStore`] using Redis Sorted Sets.
-    ///
-    /// This store uses Redis Sorted Sets to track request timestamps for each client.
-    /// It's suitable for distributed applications where rate limiting data needs
-    /// to be shared across multiple instances.
-    ///
-    /// # Features
-    ///
-    /// - **Distributed**: Share rate limiting data across multiple application instances
-    /// - **Persistent**: Data survives application restarts
-    /// - **Scalable**: Can handle high throughput with proper Redis configuration
-    /// - **Automatic cleanup**: Uses Redis expiration to clean up old data
-    ///
-    /// # Redis Data Structure
-    ///
-    /// Uses Redis Sorted Sets where:
-    /// - Key: `{prefix}{client_id}`
-    /// - Score: Request timestamp in milliseconds
-    /// - Member: Same as score (timestamp)
-    ///
-    /// # Fallback Strategy
-    ///
-    /// If Redis operations fail, the store falls back to allowing requests
-    /// to prevent service disruption.
-    pub struct RedisStore {
-        /// Redis client for database operations
-        client: Client,
-        /// Key prefix for namespacing rate limit data
-        prefix: String,
-    }
+/// Runtime Redis failure handling. Startup connection failures always return an error.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FailurePolicy {
+    /// Preserve availability by admitting requests when Redis is unavailable.
+    #[default]
+    FailOpen,
+    /// Return an error; the middleware responds with HTTP 503.
+    FailClosed,
+}
 
-    impl RedisStore {
-        /// Creates a new [`RedisStore`] instance and tests the connection.
-        ///
-        /// # Arguments
-        ///
-        /// * `redis_url` - Redis connection URL
-        ///
-        /// # URL Format
-        ///
-        /// `redis://[<username>][:<password>@]<hostname>[:port][/<db>]`
-        ///
-        /// # Examples
-        ///
-        /// ```rust,no_run
-        /// # #[cfg(feature = "redis")]
-        /// # {
-        /// use actix_web_ratelimit::store::RedisStore;
-        ///
-        /// // Basic connection
-        /// let store = RedisStore::new("redis://127.0.0.1/")?;
-        ///
-        /// // With authentication and specific database
-        /// let store = RedisStore::new("redis://:password@127.0.0.1:6379/1")?;
-        /// # }
-        /// # Ok::<(), redis::RedisError>(())
-        /// ```
-        ///
-        /// # Errors
-        ///
-        /// Returns [`RedisError`] if:
-        /// - URL format is invalid
-        /// - Cannot connect to Redis server
-        /// - PING command fails
-        pub fn new(redis_url: &str) -> Result<Self, RedisError> {
-            let client = Client::open(redis_url)?;
-            let mut conn = client.get_connection()?;
-            let _: RedisResult<()> = redis::cmd("PING").query(&mut conn);
+#[derive(Debug, Clone)]
+pub struct RedisStoreOptions {
+    /// Total deadline for initialization or a check, including reconnect waits.
+    pub timeout: Duration,
+    pub failure_policy: FailurePolicy,
+}
 
-            Ok(Self {
-                client,
-                prefix: REDIS_PREFIX.to_string(),
-            })
-        }
-
-        /// Sets a custom prefix for Redis keys.
-        ///
-        /// This is useful for namespacing when multiple applications
-        /// or environments share the same Redis instance.
-        ///
-        /// # Arguments
-        ///
-        /// * `prefix` - Custom prefix for Redis keys
-        ///
-        /// # Example
-        ///
-        /// ```rust,no_run
-        /// # #[cfg(feature = "redis")]
-        /// # {
-        /// use actix_web_ratelimit::store::RedisStore;
-        ///
-        /// let store = RedisStore::new("redis://127.0.0.1/")?
-        ///     .with_prefix("myapp:ratelimit:");
-        /// # }
-        /// # Ok::<(), redis::RedisError>(())
-        /// ```
-        pub fn with_prefix(mut self, prefix: &str) -> Self {
-            self.prefix = prefix.to_string();
-            self
-        }
-
-        /// Generates the full Redis key by combining prefix and client identifier.
-        ///
-        /// # Arguments
-        ///
-        /// * `key` - Client identifier (typically IP address)
-        ///
-        /// # Returns
-        ///
-        /// Full Redis key string
-        fn get_key(&self, key: &str) -> String {
-            format!("{}{}", self.prefix, key)
-        }
-    }
-
-    impl RateLimitStore for RedisStore {
-        /// Checks if the client has exceeded the rate limit using Redis Sorted Sets.
-        ///
-        /// This method implements a distributed sliding window algorithm:
-        /// 1. Removes expired request timestamps from the sorted set
-        /// 2. Counts remaining requests in the time window
-        /// 3. Checks if count exceeds the configured limit
-        /// 4. If not exceeded, adds current timestamp to the set
-        /// 5. Sets expiration time for automatic cleanup
-        ///
-        /// # Fallback Strategy
-        ///
-        /// If any Redis operation fails, the method returns `false` (allow request)
-        /// to prevent service disruption. Errors are logged for monitoring.
-        ///
-        /// # Arguments
-        ///
-        /// * `key` - Client identifier (typically IP address)
-        /// * `config` - Rate limiting configuration
-        ///
-        /// # Returns
-        ///
-        /// `true` if the client has exceeded the rate limit, `false` otherwise
-        fn is_limited(&self, key: &str, config: &RateLimitConfig) -> bool {
-            let redis_key = self.get_key(key);
-
-            debug!(
-                "Checking rate limit for key: {} with config: max_req={}, window={:?}",
-                key, config.max_requests, config.window_secs
-            );
-
-            let mut conn = match self.client.get_connection() {
-                Ok(conn) => conn,
-                Err(err) => {
-                    error!("Failed to get Redis connection: {}", err);
-                    // Fallback: allow request when connection fails (graceful degradation)
-                    return false;
-                }
-            };
-
-            // Use Redis Sorted Set to store request timestamps
-            let now = chrono::Utc::now().timestamp_millis() as f64;
-            let window_start = now - config.window_secs.as_millis() as f64;
-
-            // Step 1: Remove expired requests outside the time window
-            let remove_result: redis::RedisResult<i32> = redis::cmd("ZREMRANGEBYSCORE")
-                .arg(&redis_key)
-                .arg("-inf")
-                .arg(window_start)
-                .query(&mut conn);
-
-            if let Err(err) = remove_result {
-                error!("Failed to remove old entries: {}", err);
-            }
-
-            // Step 2: Count current requests within the time window
-            let count_result: redis::RedisResult<usize> = redis::cmd("ZCOUNT")
-                .arg(&redis_key)
-                .arg(window_start)
-                .arg("+inf")
-                .query(&mut conn);
-
-            let count = match count_result {
-                Ok(c) => c,
-                Err(err) => {
-                    error!("Redis error on ZCOUNT: {}", err);
-                    // Fallback: allow request when count fails (graceful degradation)
-                    return false;
-                }
-            };
-
-            if count > config.max_requests {
-                warn!(
-                    "Rate limit exceeded for key({}): count({}) > max_req({})",
-                    key, count, config.max_requests
-                );
-                return true;
-            }
-
-            // Step 3: Add current request timestamp
-            let add_result: redis::RedisResult<()> = redis::cmd("ZADD")
-                .arg(&redis_key)
-                .arg(now)
-                .arg(now)
-                .query(&mut conn);
-
-            if let Err(err) = add_result {
-                error!("Failed to add new entry: {}", err);
-            }
-
-            // Step 4: Set expiration time slightly longer than window for cleanup
-            let expiry = config.window_secs.as_secs() + 10;
-            let expire_result: redis::RedisResult<()> = redis::cmd("EXPIRE")
-                .arg(&redis_key)
-                .arg(expiry as i64)
-                .query(&mut conn);
-
-            if let Err(err) = expire_result {
-                error!("Failed to set expiry: {}", err);
-            }
-
-            false
-        }
-    }
-
-    /// Implementation of [`RateLimitStore`] for `Arc<RedisStore>` to enable shared ownership.
-    ///
-    /// This allows the same `RedisStore` instance to be used across multiple threads
-    /// and middleware instances safely.
-    impl RateLimitStore for Arc<RedisStore> {
-        /// Delegates to the underlying `RedisStore` implementation.
-        fn is_limited(&self, key: &str, config: &RateLimitConfig) -> bool {
-            (**self).is_limited(key, config)
+impl Default for RedisStoreOptions {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(1),
+            failure_policy: FailurePolicy::FailOpen,
         }
     }
 }
 
-#[cfg(feature = "redis")]
-pub use redis_store_impl::RedisStore;
+/// Atomic distributed sliding windows using server time and a shared async connection.
+///
+/// Clones multiplex the same connection and reconnect automatically. Initialize the
+/// store once before starting workers. Keys encode prefix, rule, window, quota and
+/// client ID. Client IDs should be internal identifiers, never raw credentials.
+#[derive(Clone)]
+pub struct RedisStore {
+    connection: ConnectionManager,
+    prefix: String,
+    options: RedisStoreOptions,
+}
+
+impl RedisStore {
+    /// Connects and verifies Redis asynchronously, using the default options.
+    pub async fn new(redis_url: &str) -> RedisResult<Self> {
+        Self::with_options(redis_url, RedisStoreOptions::default()).await
+    }
+
+    /// Connects, verifies PING and loads the admission script within one deadline.
+    pub async fn with_options(redis_url: &str, options: RedisStoreOptions) -> RedisResult<Self> {
+        if options.timeout.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Redis timeout must be greater than zero",
+            )
+            .into());
+        }
+        let client = Client::open(redis_url)?;
+        let config = ConnectionManagerConfig::new()
+            .set_connection_timeout(Some(options.timeout))
+            .set_response_timeout(Some(options.timeout));
+        let connection = tokio::time::timeout(options.timeout, async {
+            let mut connection = ConnectionManager::new_with_config(client, config).await?;
+            redis::cmd("PING")
+                .query_async::<String>(&mut connection)
+                .await?;
+            SCRIPT.load_async(&mut connection).await?;
+            Ok::<_, RedisError>(connection)
+        })
+        .await
+        .map_err(|_| Self::timeout_error())??;
+        Ok(Self {
+            connection,
+            prefix: "rate_limit:".to_owned(),
+            options,
+        })
+    }
+
+    pub fn with_prefix(mut self, prefix: &str) -> Self {
+        self.prefix = prefix.to_owned();
+        self
+    }
+
+    fn timeout_error() -> RedisError {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "Redis rate limit deadline exceeded",
+        )
+        .into()
+    }
+
+    fn get_key(&self, key: &str, config: &RateLimitConfig) -> String {
+        // Byte-length framing prevents collisions even when identifiers contain colons.
+        format!(
+            "{}v2:{}:{}:{}:{}:{}:{}",
+            self.prefix,
+            config.namespace.len(),
+            config.namespace,
+            config.window_secs.as_nanos(),
+            config.max_requests,
+            key.len(),
+            key
+        )
+    }
+
+    async fn check(&self, key: &str, config: &RateLimitConfig) -> RedisResult<bool> {
+        let mut connection = self.connection.clone();
+        // Round up sub-microsecond durations so Redis never expires a request early.
+        let window_micros = config.window_secs.as_nanos().div_ceil(1_000) as u64;
+        let limited: bool = SCRIPT
+            .key(self.get_key(key, config))
+            .arg(window_micros)
+            .arg(config.max_requests)
+            .invoke_async(&mut connection)
+            .await?;
+        Ok(limited)
+    }
+}
+
+impl RateLimitStore for RedisStore {
+    fn is_limited<'a>(
+        &'a self,
+        key: &'a str,
+        config: &'a RateLimitConfig,
+    ) -> BoxFuture<'a, Result<bool, StoreError>> {
+        Box::pin(async move {
+            config.validate().map_err(StoreError::new)?;
+            if config.max_requests == 0 {
+                return Ok(true);
+            }
+            let result = tokio::time::timeout(self.options.timeout, self.check(key, config))
+                .await
+                .unwrap_or_else(|_| Err(Self::timeout_error()));
+            match result {
+                Ok(limited) => Ok(limited),
+                Err(error) => {
+                    // Do not log client IDs, Redis URLs or server-provided error details.
+                    log::warn!(
+                        "Redis rate limit check failed; policy={:?}",
+                        self.options.failure_policy
+                    );
+                    match self.options.failure_policy {
+                        FailurePolicy::FailOpen => Ok(false),
+                        FailurePolicy::FailClosed => Err(StoreError::new(error)),
+                    }
+                }
+            }
+        })
+    }
+}

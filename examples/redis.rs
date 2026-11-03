@@ -19,6 +19,7 @@ async fn main() -> std::io::Result<()> {
     let store = Arc::new(
         // redis://[<username>][:<password>@]<hostname>[:port][/<db>]
         RedisStore::new("redis://127.0.0.1/0")
+            .await
             .expect("Failed to connect to Redis")
             // Custom prefix for Redis keys
             .with_prefix("myapp:ratelimit:"),

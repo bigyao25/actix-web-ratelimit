@@ -43,7 +43,7 @@ jobs:
         include:
           - features: default
             cargo-flags: ""
-            redis-image: redis:7-alpine
+            redis-image: redis:8-alpine
           - features: no-default
             cargo-flags: --no-default-features
             redis-image: ""
@@ -73,6 +73,11 @@ jobs:
         run: cargo clippy --locked --all-targets ${{ matrix.cargo-flags }} -- -D warnings
       - name: Run tests for all targets
         run: cargo test --locked --all-targets ${{ matrix.cargo-flags }}
+      - name: Test atomic Redis admission and transport failures
+        if: matrix.features == 'default'
+        env:
+          REDIS_URL: redis://127.0.0.1:6379/
+        run: cargo test --locked --test redis --test redis_transport -- --ignored
       # --all-targets excludes doctests, so run them explicitly.
       - name: Test documentation examples
         run: cargo test --locked --doc ${{ matrix.cargo-flags }}
