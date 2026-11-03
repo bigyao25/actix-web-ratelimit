@@ -1,0 +1,113 @@
+name: Security
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  schedule:
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  codeql:
+    name: Analyze Rust with CodeQL
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: rust
+          build-mode: none
+      - name: Analyze and upload results
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: /language:rust
+
+  dependencies:
+    name: Check dependency security and licenses
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: Cache dependency downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/src
+            ~/.cargo/git/db
+          key: security-cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            security-cargo-${{ runner.os }}-
+
+      - name: Check advisories, licenses, bans, and sources
+        run: cargo deny --all-features --locked check
+
+  secrets:
+    name: Scan for leaked credentials
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Scan Git history with Gitleaks
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          # Scheduled/manual runs and new branches get a full-history audit.
+          # PRs use the merge base so diverged branches scan only their changes.
+          log_opts="--all"
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            base=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
+            log_opts="$base..$HEAD_SHA"
+          elif [ "$EVENT_NAME" = "push" ] && \
+               [ -n "$BASE_SHA" ] && \
+               [ "$BASE_SHA" != "0000000000000000000000000000000000000000" ] && \
+               git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
+            log_opts="$BASE_SHA..$HEAD_SHA"
+          fi
+
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            --volume "$PWD:/repo:ro" \
+            zricethezav/gitleaks:v8.24.3 \
+            git /repo --redact --log-opts="$log_opts"

@@ -79,8 +79,7 @@ impl Default for RateLimitConfig {
                     .to_string()
             },
             on_exceed: |_id, _config, _req| {
-                HttpResponse::TooManyRequests()
-                    .body("Too many requests")
+                HttpResponse::TooManyRequests().body("Too many requests")
             },
         }
     }
