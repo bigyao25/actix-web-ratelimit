@@ -19,23 +19,32 @@ A simple and highly customizable rate limiting middleware for actix-web 4.
 - **Customizable**: Custom client identification and rate limit exceeded handlers
 - **Thread Safe**: Concurrent request handling with DashMap
 
+Requires Rust 1.89 or newer. Redis integration tests target Redis 7 and 8.
+
 ## Quick Start
 
 Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-actix-web-ratelimit = "0.1"
+actix-web-ratelimit = "0.2"
 
-# Or, for Redis support
-actix-web-ratelimit = { version = "0.1", features = ["redis"] }
+# Redis support is enabled by default. For a memory-only build:
+actix-web-ratelimit = { version = "0.2", default-features = false }
 ```
 
 ## Usage
 
 ### Basic Usage with In-Memory Store
 
-```rust
+```rust,no_run
+# use actix_web::{web, App, HttpResponse, HttpServer};
+# use actix_web_ratelimit::{RateLimit, config::RateLimitConfig, store::MemoryStore};
+# #[cfg(feature = "redis")]
+# use actix_web_ratelimit::store::RedisStore;
+# use std::sync::Arc;
+# async fn example() -> std::io::Result<()> {
+# async fn index() -> HttpResponse { HttpResponse::Ok().finish() }
     // Configure rate limiting: allow 3 requests per 10-second window
     let config = RateLimitConfig::default().max_requests(3).window_secs(10);
     // Create in-memory store for tracking request timestamps
@@ -50,16 +59,25 @@ actix-web-ratelimit = { version = "0.1", features = ["redis"] }
     .bind(("127.0.0.1", 8080))?
     .run()
     .await
+# }
 ```
 
 ### Advanced Configuration
 
-```rust
+```rust,no_run
+# use actix_web::{web, App, HttpResponse, HttpServer};
+# use actix_web_ratelimit::{RateLimit, config::RateLimitConfig, store::MemoryStore};
+# #[cfg(feature = "redis")]
+# use actix_web_ratelimit::store::RedisStore;
+# use std::sync::Arc;
+# async fn example() -> std::io::Result<()> {
+# async fn index() -> HttpResponse { HttpResponse::Ok().finish() }
     let store = Arc::new(MemoryStore::new());
     let config = RateLimitConfig::default()
+        .namespace("api")
         .max_requests(3)
         .window_secs(10)
-        // Extract client identifier from req. It is IP (realip_remote_addr) by default.
+        // Extract a client identifier. The default is the peer IP without its source port.
         .id(|req| {
             req.headers()
                 .get("X-Client-Id")
@@ -83,21 +101,31 @@ actix-web-ratelimit = { version = "0.1", features = ["redis"] }
     .bind(("127.0.0.1", 8080))?
     .run()
     .await
+# }
 ```
 
 ### Redis Store
 
-first set feature `redis` enable:
+The `redis` feature is enabled by default. Enable it explicitly if default features are disabled:
 
 ```toml
-actix-web-ratelimit = { version = "0.1", features = [ "redis" ] }
+actix-web-ratelimit = { version = "0.2", features = [ "redis" ] }
 ```
 
-then you can use it:
+Create the store once, before starting HTTP workers:
 
-```rust
+```rust,no_run
+# use actix_web::{web, App, HttpResponse, HttpServer};
+# use actix_web_ratelimit::{RateLimit, config::RateLimitConfig, store::MemoryStore};
+# #[cfg(feature = "redis")]
+# use actix_web_ratelimit::store::RedisStore;
+# use std::sync::Arc;
+# #[cfg(feature = "redis")]
+# async fn example() -> std::io::Result<()> {
+# async fn index() -> HttpResponse { HttpResponse::Ok().finish() }
     let store = Arc::new(
         RedisStore::new("redis://127.0.0.1/0")
+            .await
             .expect("Failed to connect to Redis")
             // Custom prefix for Redis keys
             .with_prefix("myapp:ratelimit:"),
@@ -112,7 +140,26 @@ then you can use it:
     .bind(("127.0.0.1", 8080))?
     .run()
     .await
+# }
 ```
+
+`RedisStore::new(url).await` uses a one-second deadline and `FailurePolicy::FailOpen`: Redis errors allow requests. Use `with_options` to configure the deadline and return HTTP 503 on backend failures:
+
+```rust,no_run
+# #[cfg(feature = "redis")]
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+use actix_web_ratelimit::store::{FailurePolicy, RedisStore, RedisStoreOptions};
+use std::time::Duration;
+
+let store = RedisStore::with_options("redis://127.0.0.1/0", RedisStoreOptions {
+    timeout: Duration::from_millis(250),
+    failure_policy: FailurePolicy::FailClosed,
+}).await?;
+# Ok(())
+# }
+```
+
+Initialization errors are always returned. Clones reuse an asynchronous connection and reconnect automatically. Each check has a total deadline including reconnect waits; a timeout may occur after quota has already been recorded. Redis keys contain the client identifier, so use non-secret IDs rather than raw API keys.
 
 ## Configuration Options
 
@@ -120,10 +167,17 @@ then you can use it:
 
 | Method | Description | Default |
 | ------ | ------ | -------- |
-| `max_requests(usize)` | Maximum requests per window | 10 |
-| `window_secs(u64)` | Time window in seconds | 100 |
-| `id(fn)` | Client identification function | IP address |
+| `namespace(name)` | Logical rule name | `"default"` |
+| `max_requests(usize)` | Maximum requests per window; zero denies all | 10 |
+| `window_secs(u64)` | Positive time window in seconds | 100 |
+| `id(fn)` | Client identification function | Peer IP without source port |
 | `exceeded(fn)` | Rate limit exceeded handler | 429 response |
+
+The default identifier ignores `Forwarded` and `X-Forwarded-For`. Behind a proxy, supply a validated identity extractor through `id(...)`; otherwise clients share the proxy's IP bucket. Header-based examples assume the application validates those headers.
+
+Equal namespace, window, quota and client ID share a bucket in the same store or Redis prefix. Use different namespaces for independent routes with equal quotas; different windows or quotas are isolated automatically.
+
+Use `config.validate()` or `RateLimit::try_new(config, store)` to handle invalid settings; `RateLimit::new` panics on invalid configuration. Zero windows are invalid. The request limit and rounded microsecond window must not exceed `2^53 - 1`. Sub-second windows can be set through the public `window_secs: Duration` field.
 
 ### Storage Backends
 
@@ -133,11 +187,19 @@ then you can use it:
 - **Cons**: Not distributed, data lost on restart
 - **Use case**: Single instance applications
 
+Inactive buckets are swept at most once per minute when requests arrive. Call `store.prune_expired()` from an application timer for cleanup while idle. Sweeps scan all buckets; no background task is started automatically.
+
 #### RedisStore (requires `redis` feature)
 
-- **Pros**: Distributed, persistent, scalable
+- **Pros**: Distributed, asynchronous, atomic admission
 - **Cons**: Requires Redis server
 - **Use case**: Multi-instance applications
+
+Redis uses server time and an atomic Lua script with unique members. Window precision is one microsecond, rounding up smaller durations; TTL precision is one millisecond. Persistence and failover guarantees depend on Redis configuration.
+
+#### Custom Store
+
+Implement `RateLimitStore::is_limited` with `fn is_limited<'a>(&'a self, key: &'a str, config: &'a RateLimitConfig) -> BoxFuture<'a, Result<bool, StoreError>>` (`BoxFuture` is from `futures-util`). Admission must be atomic and network I/O asynchronous. Direct checks use `store.is_limited(key, &config).await?`: `true` means HTTP 429; storage errors produce HTTP 503. `Arc` and `Box` trait objects are supported.
 
 ## Algorithm
 
@@ -146,9 +208,11 @@ This middleware uses a **sliding window** algorithm:
 1. Extract client identifier from request
 2. Retrieve stored request timestamps for the client
 3. Remove expired timestamps outside the time window
-4. Check if remaining request count exceeds the limit
+4. Check if remaining request count has reached the limit
 5. If not exceeded, record new timestamp and allow request
 6. If exceeded, call the rate limit handler
+
+The window is `(now - window, now]`. Only admitted requests are recorded; rejected requests do not extend the window or renew the Redis TTL.
 
 ## Examples
 
@@ -168,9 +232,23 @@ curl http://localhost:8080/
 for i in {1..5}; do echo "$(curl -s http://localhost:8080)\r"; done
 ```
 
+### Tests and Benchmarks
+
+```bash
+cargo test --locked --all-targets
+cargo test --locked --doc
+cargo test --locked --all-targets --no-default-features
+cargo test --locked --doc --no-default-features
+cargo publish --locked --dry-run
+REDIS_URL=redis://127.0.0.1:6379/ cargo test --locked --all-targets --all-features -- --include-ignored
+cargo bench --locked --bench memory --no-default-features
+```
+
+Redis tests use isolated prefixes and never flush the database. The memory microbenchmark covers 1, 100 and 10,000 clients; its results are not HTTP throughput guarantees.
+
 ## [features]
 
-- `redis`: Enables Redis storage backend support
+- `redis`: Enables Redis storage backend support (enabled by default)
 
 ## License
 

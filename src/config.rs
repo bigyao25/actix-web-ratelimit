@@ -1,5 +1,29 @@
 use actix_web::{HttpResponse, dev::ServiceRequest};
-use std::time::Duration;
+use std::{fmt, time::Duration};
+
+const MAX_EXACT_INTEGER: u128 = (1_u128 << 53) - 1;
+
+/// Invalid sliding-window settings. A zero request limit is valid and denies all requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigError {
+    ZeroWindow,
+    WindowTooLarge,
+    LimitTooLarge,
+}
+
+impl fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::ZeroWindow => "the rate limit window must be greater than zero",
+            Self::WindowTooLarge => {
+                "the rate limit window exceeds the exact Redis microsecond range"
+            }
+            Self::LimitTooLarge => "the request limit exceeds the exact Redis integer range",
+        })
+    }
+}
+
+impl std::error::Error for ConfigError {}
 
 /// Configuration for rate limiting middleware.
 ///
@@ -38,6 +62,8 @@ use std::time::Duration;
 /// ```
 #[derive(Clone)]
 pub struct RateLimitConfig {
+    /// Logical rule name. Equal namespace, window and quota share a bucket per client.
+    pub namespace: String,
     /// Maximum number of requests allowed within the time window
     pub max_requests: usize,
     /// Duration of the sliding time window
@@ -57,7 +83,7 @@ impl Default for RateLimitConfig {
     ///
     /// - `max_requests`: 10 requests
     /// - `window_secs`: 100 seconds
-    /// - `get_id`: Extracts real IP address from connection info
+    /// - `get_id`: Extracts the peer IP, ignoring untrusted forwarding headers
     /// - `on_exceed`: Returns HTTP 429 "Too Many Requests" with plain text body
     ///
     /// # Example
@@ -70,13 +96,13 @@ impl Default for RateLimitConfig {
     /// ```
     fn default() -> Self {
         Self {
+            namespace: "default".to_owned(),
             max_requests: 10,
             window_secs: Duration::from_secs(100),
             get_id: |req| {
-                req.connection_info()
-                    .realip_remote_addr()
-                    .unwrap_or("-")
-                    .to_string()
+                req.peer_addr()
+                    .map(|addr| addr.ip().to_canonical().to_string())
+                    .unwrap_or_else(|| "unknown".to_owned())
             },
             on_exceed: |_id, _config, _req| {
                 HttpResponse::TooManyRequests().body("Too many requests")
@@ -86,11 +112,31 @@ impl Default for RateLimitConfig {
 }
 
 impl RateLimitConfig {
+    /// Validates the common numeric range used by both built-in backends.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.window_secs.is_zero() {
+            return Err(ConfigError::ZeroWindow);
+        }
+        if self.window_secs.as_nanos().div_ceil(1_000) > MAX_EXACT_INTEGER {
+            return Err(ConfigError::WindowTooLarge);
+        }
+        if self.max_requests as u128 > MAX_EXACT_INTEGER {
+            return Err(ConfigError::LimitTooLarge);
+        }
+        Ok(())
+    }
+
+    /// Names a logical quota, such as `login` or `search`. Different names never share counters.
+    pub fn namespace(mut self, value: impl Into<String>) -> Self {
+        self.namespace = value.into();
+        self
+    }
+
     /// Sets the maximum number of requests allowed within the time window.
     ///
     /// # Arguments
     ///
-    /// * `value` - Maximum number of requests (must be > 0)
+    /// * `value` - Maximum admitted requests; zero denies all requests
     ///
     /// # Example
     ///

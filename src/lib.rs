@@ -1,188 +1,57 @@
-/*!
-A simple and highly customizable rate limiting middleware for actix-web 4.
+//! Sliding-window rate limiting middleware for Actix Web 4.
+//!
+//! The memory backend is process-local. With the default `redis` feature, the Redis
+//! backend shares atomic quotas across workers and application instances.
+//!
+//! ```rust,no_run
+//! use actix_web::{App, HttpServer, HttpResponse, web};
+//! use actix_web_ratelimit::{RateLimit, config::RateLimitConfig, store::MemoryStore};
+//! use std::sync::Arc;
+//!
+//! #[actix_web::main]
+//! async fn main() -> std::io::Result<()> {
+//!     let store = Arc::new(MemoryStore::new());
+//!     let config = RateLimitConfig::default().namespace("api").max_requests(100).window_secs(60);
+//!     HttpServer::new(move || App::new()
+//!         .wrap(RateLimit::new(config.clone(), store.clone()))
+//!         .route("/", web::get().to(|| async { HttpResponse::Ok().body("Hello") })))
+//!         .bind(("127.0.0.1", 8080))?.run().await
+//! }
+//! ```
+//!
+//! Redis initialization and direct checks are asynchronous:
+//!
+//! ```rust,no_run
+//! # #[cfg(feature = "redis")]
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! use actix_web_ratelimit::{config::RateLimitConfig, store::{RedisStore, RateLimitStore}};
+//! let store = RedisStore::new("redis://127.0.0.1:6379/").await?;
+//! let limited = store.is_limited("internal-user-id", &RateLimitConfig::default()).await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! The window is `(now - window, now]`; rejected requests do not extend it. A zero
+//! quota denies all requests. Zero windows and out-of-range numeric settings are
+//! rejected by [`config::RateLimitConfig::validate`] and [`RateLimit::try_new`].
+//! The default identity is the peer IP, without its source port. Applications behind
+//! trusted proxies should supply a validated identity extractor via
+//! [`config::RateLimitConfig::id`]. Backend errors become HTTP 503; exhausted quotas
+//! invoke the configurable HTTP 429 callback. See the repository README for options,
+//! failure policies, testing commands and custom store implementations.
 
-For complete documentation and examples, visit the [GitHub repository](https://github.com/bigyao25/actix-web-ratelimit).
-
-## Features
-
-- **actix-web 4 Compatible**: Built specifically for actix-web 4
-- **Simple & Easy to Use**: Minimal configuration required
-- **Pluggable Storage**: Support for in-memory and Redis storage backends
-- **High Performance**: Efficient sliding window algorithm
-- **Customizable**: Custom client identification and rate limit exceeded handlers
-- **Thread Safe**: Concurrent request handling with DashMap
-
-
-## Quick Start
-
-Add this to your `Cargo.toml`:
-
-```toml
-[dependencies]
-actix-web-ratelimit = "0.1"
-
-# Or, for Redis support
-actix-web-ratelimit = { version = "0.1", features = ["redis"] }
-```
-
-## Usage
-
-### Basic Usage with In-Memory Store
-
-```rust, no_run
-# use actix_web::{App, HttpServer, Responder, web};
-# use actix_web_ratelimit::{RateLimit, config::RateLimitConfig, store::MemoryStore};
-# use std::sync::Arc;
-#
-# async fn index() -> impl Responder {
-#     "Hello world!"
-# }
-#
-# #[actix_web::main]
-# async fn main() -> std::io::Result<()> {
-    // Configure rate limiting: allow 3 requests per 10-second window
-    let config = RateLimitConfig::default().max_requests(3).window_secs(10);
-    // Create in-memory store for tracking request timestamps
-    let store = Arc::new(MemoryStore::new());
-
-    HttpServer::new(move || {
-        App::new()
-            // Create and register the rate limit middleware.
-            .wrap(RateLimit::new(config.clone(), store.clone()))
-            .route("/", web::get().to(index))
-    })
-    .bind(("127.0.0.1", 8080))?
-    .run()
-    .await
-# }
-```
-
-### Advanced Configuration
-
-```rust, no_run
-# use actix_web::HttpResponse;
-# use actix_web::{App, HttpServer, Responder, web};
-# use actix_web_ratelimit::config::RateLimitConfig;
-# use actix_web_ratelimit::{RateLimit, store::MemoryStore};
-# use std::sync::Arc;
-#
-# async fn index() -> impl Responder {
-#     "Hello world!"
-# }
-#
-# #[actix_web::main]
-# async fn main() -> std::io::Result<()> {
-    let store = Arc::new(MemoryStore::new());
-    let config = RateLimitConfig::default()
-        .max_requests(3)
-        .window_secs(10)
-        // Extract client identifier from req. It is IP (realip_remote_addr) by default.
-        .id(|req| {
-            req.headers()
-                .get("X-Client-Id")
-                .and_then(|h| h.to_str().ok())
-                .unwrap_or("anonymous")
-                .to_string()
-        })
-        // Custom handler for rate limit exceeded. It returns a 429 response by default.
-        .exceeded(|id, config, _req| {
-            HttpResponse::TooManyRequests().body(format!(
-                "429 caused: client-id: {}, limit: {}req/{:?}",
-                id, config.max_requests, config.window_secs
-            ))
-        });
-
-    HttpServer::new(move || {
-        App::new()
-            .wrap(RateLimit::new(config.clone(), store.clone()))
-            .route("/", web::get().to(index))
-    })
-    .bind(("127.0.0.1", 8080))?
-    .run()
-    .await
-# }
-```
-
-### Redis Store
-
-First, enable the `redis` feature:
-
-```toml
-[dependencies]
-actix-web-ratelimit = { version = "0.1", features = ["redis"] }
-```
-
-Then you can use Redis as the storage backend:
-
-```rust, no_run
-# #[cfg(feature = "redis")]
-# use actix_web::{App, HttpServer, Responder, web};
-# #[cfg(feature = "redis")]
-# use actix_web_ratelimit::store::RedisStore;
-# #[cfg(feature = "redis")]
-# use actix_web_ratelimit::{RateLimit, config::RateLimitConfig};
-# #[cfg(feature = "redis")]
-# use std::sync::Arc;
-#
-# #[cfg(feature = "redis")]
-# async fn index() -> impl Responder {
-#     "Hello world!"
-# }
-#
-# #[cfg(feature = "redis")]
-# #[actix_web::main]
-# async fn main() -> std::io::Result<()> {
-    let store = Arc::new(
-        RedisStore::new("redis://127.0.0.1/0")
-            .expect("Failed to connect to Redis")
-            // Custom prefix for Redis keys
-            .with_prefix("myapp:ratelimit:"),
-    );
-    let config = RateLimitConfig::default().max_requests(3).window_secs(10);
-
-    HttpServer::new(move || {
-        App::new()
-            .wrap(RateLimit::new(config.clone(), store.clone()))
-            .route("/", web::get().to(index))
-    })
-    .bind(("127.0.0.1", 8080))?
-    .run()
-    .await
-# }
-
-# #[cfg(not(feature = "redis"))]
-# fn main() {}
-
-```
-
-## Storage Backends
-
-This crate provides two built-in storage implementations:
-
-- [`store::MemoryStore`] - In-memory storage using [`dashmap::DashMap`]
-- [`store::RedisStore`] - Distributed storage using Redis (requires `redis` feature)
-
-For custom storage backends, implement the [`store::RateLimitStore`] trait.
-
-## Configuration
-
-Rate limiting behavior is controlled by [`config::RateLimitConfig`]:
-
-- `max_requests` - Maximum requests allowed within the time window
-- `window_secs` - Duration of the sliding time window in seconds
-- `get_id` - Function to extract client identifier from requests
-- `on_exceed` - Function called when rate limit is exceeded
-
-## Related Resources
-
-- [Crates.io](https://crates.io/crates/actix-web-ratelimit) - Package information
-- [Docs.rs](https://docs.rs/actix-web-ratelimit) - API documentation
-- [GitHub](https://github.com/bigyao25/actix-web-ratelimit) - Source code and issues
-- [Examples](https://github.com/bigyao25/actix-web-ratelimit/tree/main/examples) - Usage examples
-
- */
 pub mod config;
 pub mod store;
+
+// Compile both READMEs as doctests so their public API examples cannot silently drift.
+#[cfg(doctest)]
+mod readme_examples {
+    #[doc = include_str!("../README.md")]
+    struct English;
+
+    #[doc = include_str!("../README-cn.md")]
+    struct Chinese;
+}
 
 use actix_service::{Service, Transform};
 use actix_web::{
@@ -192,11 +61,15 @@ use actix_web::{
 };
 use futures_util::future::{LocalBoxFuture, Ready, ok};
 use std::{
+    rc::Rc,
     sync::Arc,
     task::{Context, Poll},
 };
 
-use crate::{config::RateLimitConfig, store::RateLimitStore};
+use crate::{
+    config::{ConfigError, RateLimitConfig},
+    store::RateLimitStore,
+};
 
 pub struct RateLimit<S>
 where
@@ -210,11 +83,19 @@ impl<S> RateLimit<S>
 where
     S: RateLimitStore,
 {
+    /// Creates middleware. Panics for an invalid window or numeric range.
+    /// Use [`Self::try_new`] to handle configuration errors without panicking.
+    #[track_caller]
     pub fn new(config: RateLimitConfig, store: S) -> Self {
-        Self {
+        Self::try_new(config, store).expect("invalid rate limit configuration")
+    }
+
+    pub fn try_new(config: RateLimitConfig, store: S) -> Result<Self, ConfigError> {
+        config.validate()?;
+        Ok(Self {
             store: Arc::new(store),
             config: Arc::new(config),
-        }
+        })
     }
 }
 
@@ -233,7 +114,7 @@ where
 
     fn new_transform(&self, service: S) -> Self::Future {
         ok(RateLimitMiddleware {
-            service,
+            service: Rc::new(service),
             store: self.store.clone(),
             config: self.config.clone(),
         })
@@ -241,7 +122,7 @@ where
 }
 
 pub struct RateLimitMiddleware<S> {
-    service: S,
+    service: Rc<S>,
     store: Arc<dyn RateLimitStore>,
     config: Arc<RateLimitConfig>,
 }
@@ -261,17 +142,27 @@ where
     }
 
     fn call(&self, req: ServiceRequest) -> Self::Future {
-        let ip = (self.config.get_id)(&req);
-
-        if self.store.is_limited(&ip, &self.config) {
-            let res = (self.config.on_exceed)(&ip, &self.config, &req);
-            let res = req.into_response(res).map_into_right_body();
-            return Box::pin(async { Ok(res) });
-        }
-
-        let fut = self.service.call(req);
+        let store = self.store.clone();
+        let config = self.config.clone();
+        let service = self.service.clone();
         Box::pin(async move {
-            let res = fut.await?;
+            let id = (config.get_id)(&req);
+            match store.is_limited(&id, &config).await {
+                Ok(true) => {
+                    let response = (config.on_exceed)(&id, &config, &req);
+                    return Ok(req.into_response(response).map_into_right_body());
+                }
+                Err(_) => {
+                    return Ok(req
+                        .into_response(
+                            actix_web::HttpResponse::ServiceUnavailable()
+                                .body("Rate limit storage unavailable"),
+                        )
+                        .map_into_right_body());
+                }
+                Ok(false) => {}
+            }
+            let res = service.call(req).await?;
             Ok(res.map_into_left_body())
         })
     }

@@ -6,6 +6,7 @@ on:
   pull_request:
     branches: ["main"]
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
@@ -33,31 +34,19 @@ jobs:
       - run: cargo fmt --all -- --check
 
   build:
-    name: Lint and test (${{ matrix.features }})
-    runs-on: ubuntu-latest
+    name: Lint and test (${{ matrix.os }}, ${{ matrix.features }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
         features: [default, no-default]
         include:
           - features: default
             cargo-flags: ""
-            redis-image: redis:7-alpine
           - features: no-default
             cargo-flags: --no-default-features
-            redis-image: ""
-    services:
-      redis:
-        # An empty image skips service startup for the no-default matrix entry.
-        image: ${{ matrix.redis-image }}
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
     steps:
       - uses: actions/checkout@v7
         with:
@@ -67,12 +56,95 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.features }}
+          key: ${{ matrix.os }}-${{ matrix.features }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Check Clippy warnings
         run: cargo clippy --locked --all-targets ${{ matrix.cargo-flags }} -- -D warnings
       - name: Run tests for all targets
         run: cargo test --locked --all-targets ${{ matrix.cargo-flags }}
-      # --all-targets excludes doctests, so run them explicitly.
       - name: Test documentation examples
         run: cargo test --locked --doc ${{ matrix.cargo-flags }}
+      - name: Check documentation warnings
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --no-deps ${{ matrix.cargo-flags }}
+
+  redis:
+    name: Real Redis (${{ matrix.redis }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        redis: [redis:7-alpine, redis:8-alpine]
+    services:
+      redis:
+        image: ${{ matrix.redis }}
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: redis
+      - name: Run the entire suite including explicit Redis tests
+        env:
+          REDIS_URL: redis://127.0.0.1:6379/
+        run: cargo test --locked --all-features --all-targets -- --include-ignored
+
+  msrv:
+    name: Minimum Rust (1.89)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.89.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      - run: cargo test --locked --all-targets --all-features
+      - run: cargo test --locked --all-targets --no-default-features
+      - run: cargo test --locked --doc --all-features
+      - run: cargo test --locked --doc --no-default-features
+
+  package:
+    name: Verify published package
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: package
+      - run: cargo package --locked
+      - name: Resolve unpacked manifest
+        id: unpacked
+        run: |
+          python3 - <<'PYTHON'
+          import os
+          import tomllib
+          from pathlib import Path
+          package = tomllib.loads(Path('Cargo.toml').read_text())['package']
+          manifest = f"target/package/{package['name']}-{package['version']}/Cargo.toml"
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              print(f'manifest={manifest}', file=output)
+          PYTHON
+      - name: Test the unpacked crate with all features
+        run: cargo test --locked --manifest-path ${{ steps.unpacked.outputs.manifest }} --all-targets --all-features
+      - name: Test the unpacked crate without default features
+        run: cargo test --locked --manifest-path ${{ steps.unpacked.outputs.manifest }} --all-targets --no-default-features
+      - name: Test the unpacked documentation
+        run: cargo test --locked --manifest-path ${{ steps.unpacked.outputs.manifest }} --doc --all-features

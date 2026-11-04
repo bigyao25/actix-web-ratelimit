@@ -42,9 +42,16 @@ jobs:
               }
             }
 
+  validate:
+    name: Run release validation matrix
+    needs: authorize
+    uses: ./.github/workflows/CI.yml
+    permissions:
+      contents: read
+
   publish:
     name: Test and publish
-    needs: authorize
+    needs: [authorize, validate]
     runs-on: ubuntu-latest
     environment: crates-io
     permissions:
