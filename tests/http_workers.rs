@@ -1,4 +1,4 @@
-use actix_web::{App, HttpResponse, HttpServer, web};
+use actix_web::{App, HttpResponse, HttpServer, dev::Service, web};
 use actix_web_ratelimit::{
     RateLimit,
     config::RateLimitConfig,
@@ -19,28 +19,40 @@ async fn exercise_workers(store: Arc<dyn RateLimitStore>) {
     let workers = Arc::new(Mutex::new(std::collections::HashSet::new()));
     let (handler_calls, handler_workers) = (calls.clone(), workers.clone());
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
+    let second_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addresses = [
+        listener.local_addr().unwrap(),
+        second_listener.local_addr().unwrap(),
+    ];
     let config = RateLimitConfig::default().max_requests(17);
     let server = HttpServer::new(move || {
         let (calls, workers) = (handler_calls.clone(), handler_workers.clone());
         App::new()
             .wrap(RateLimit::new(config.clone(), store.clone()))
+            // Observe every request, including those rejected by the inner limiter.
+            .wrap_fn(move |req, service| {
+                workers.lock().unwrap().insert(std::thread::current().id());
+                service.call(req)
+            })
             .default_service(web::to(move || {
                 calls.fetch_add(1, Ordering::SeqCst);
-                workers.lock().unwrap().insert(std::thread::current().id());
                 async { HttpResponse::Ok().body("accepted") }
             }))
     })
-    .workers(2)
+    // Actix starts one worker per listener with this setting. Address each
+    // explicitly instead of assuming connections are balanced across workers.
+    .workers(1)
     .disable_signals()
     .listen(listener)
+    .unwrap()
+    .listen(second_listener)
     .unwrap()
     .run();
     let handle = server.handle();
     let task = actix_web::rt::spawn(server);
     let responses = futures_util::future::join_all((0..128).map(|i| async move {
         tokio::time::timeout(Duration::from_secs(5), async move {
-            let mut stream = tokio::net::TcpStream::connect(address).await?;
+            let mut stream = tokio::net::TcpStream::connect(addresses[i % addresses.len()]).await?;
             stream.write_all(format!("GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nForwarded: for=192.0.2.{i}\r\nX-Forwarded-For: 198.51.100.{i}\r\n\r\n").as_bytes()).await?;
             let mut response = String::new();
             stream.read_to_string(&mut response).await?;
