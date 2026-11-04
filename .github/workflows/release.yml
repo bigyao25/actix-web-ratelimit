@@ -22,7 +22,7 @@ jobs:
       contents: read
     steps:
       - name: Check branch and administrator permissions
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const { owner, repo } = context.repo;
@@ -52,7 +52,7 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
@@ -79,3 +79,68 @@ jobs:
         run: cargo publish --locked
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  tag:
+    name: Tag and create GitHub Release
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create version tag
+        uses: actions/github-script@v7
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const tag = `tags/v${process.env.RELEASE_VERSION}`;
+            // Allow this job to be rerun without moving an existing tag.
+            try {
+              const { data } = await github.rest.git.getRef({ owner, repo, ref: tag });
+              if (data.object.sha !== context.sha) {
+                throw new Error(`${tag} already exists and points to a different commit.`);
+              }
+              core.info(`${tag} already points to ${context.sha}.`);
+            } catch (error) {
+              if (error.status !== 404) throw error;
+              await github.rest.git.createRef({
+                owner, repo, ref: `refs/${tag}`, sha: context.sha,
+              });
+            }
+      - name: Create GitHub Release
+        uses: actions/github-script@v7
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const version = process.env.RELEASE_VERSION;
+            const tag = `v${version}`;
+            let existing;
+            try {
+              const { data } = await github.rest.repos.getReleaseByTag({
+                owner, repo, tag,
+              });
+              existing = data;
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }
+            if (existing) {
+              if (existing.draft) {
+                throw new Error(`A draft release already exists for ${tag}; publish or remove it before retrying.`);
+              }
+              core.info(`Release already exists: ${existing.html_url}`);
+            } else {
+              const { data } = await github.rest.repos.createRelease({
+                owner, repo,
+                tag_name: tag,
+                name: tag,
+                target_commitish: context.sha,
+                body: `Published to crates.io: https://crates.io/crates/actix-web-ratelimit/${version}`,
+                generate_release_notes: true,
+                draft: false,
+                prerelease: version.includes('-'),
+              });
+              core.info(`Created release: ${data.html_url}`);
+            }
