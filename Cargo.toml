@@ -1,12 +1,14 @@
 [package]
 name = "actix-web-ratelimit"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
+rust-version = "1.89"
 authors = ["bigyao25 <rungroo@gmail.com>"]
 description = "A simple and highly customizable rate limiter for actix-web 4"
 license = "MIT"
 repository = "https://github.com/bigyao25/actix-web-ratelimit"
 readme = "README.md"
+include = ["src/**", "examples/**", "tests/**", "benches/**", "Cargo.toml", "Cargo.lock", "README*.md", "LICENSE"]
 keywords = ["ratelimit", "rate", "limit", "actix", "actix-web"]
 categories = ["security", "web-programming"]
 

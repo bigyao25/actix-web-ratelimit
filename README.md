@@ -19,6 +19,8 @@ A simple and highly customizable rate limiting middleware for actix-web 4.
 - **Customizable**: Custom client identification and rate limit exceeded handlers
 - **Thread Safe**: Concurrent request handling with DashMap
 
+Requires Rust 1.89 or newer. Redis integration tests target Redis 7 and 8.
+
 ## Quick Start
 
 Add this to your `Cargo.toml`:
@@ -37,7 +39,9 @@ actix-web-ratelimit = { version = "0.2", default-features = false }
 
 ```rust,no_run
 # use actix_web::{web, App, HttpResponse, HttpServer};
-# use actix_web_ratelimit::{RateLimit, config::RateLimitConfig, store::{MemoryStore, RedisStore}};
+# use actix_web_ratelimit::{RateLimit, config::RateLimitConfig, store::MemoryStore};
+# #[cfg(feature = "redis")]
+# use actix_web_ratelimit::store::RedisStore;
 # use std::sync::Arc;
 # async fn example() -> std::io::Result<()> {
 # async fn index() -> HttpResponse { HttpResponse::Ok().finish() }
@@ -62,7 +66,9 @@ actix-web-ratelimit = { version = "0.2", default-features = false }
 
 ```rust,no_run
 # use actix_web::{web, App, HttpResponse, HttpServer};
-# use actix_web_ratelimit::{RateLimit, config::RateLimitConfig, store::{MemoryStore, RedisStore}};
+# use actix_web_ratelimit::{RateLimit, config::RateLimitConfig, store::MemoryStore};
+# #[cfg(feature = "redis")]
+# use actix_web_ratelimit::store::RedisStore;
 # use std::sync::Arc;
 # async fn example() -> std::io::Result<()> {
 # async fn index() -> HttpResponse { HttpResponse::Ok().finish() }
@@ -110,8 +116,11 @@ Create the store once, before starting HTTP workers:
 
 ```rust,no_run
 # use actix_web::{web, App, HttpResponse, HttpServer};
-# use actix_web_ratelimit::{RateLimit, config::RateLimitConfig, store::{MemoryStore, RedisStore}};
+# use actix_web_ratelimit::{RateLimit, config::RateLimitConfig, store::MemoryStore};
+# #[cfg(feature = "redis")]
+# use actix_web_ratelimit::store::RedisStore;
 # use std::sync::Arc;
+# #[cfg(feature = "redis")]
 # async fn example() -> std::io::Result<()> {
 # async fn index() -> HttpResponse { HttpResponse::Ok().finish() }
     let store = Arc::new(
@@ -137,6 +146,7 @@ Create the store once, before starting HTTP workers:
 `RedisStore::new(url).await` uses a one-second deadline and `FailurePolicy::FailOpen`: Redis errors allow requests. Use `with_options` to configure the deadline and return HTTP 503 on backend failures:
 
 ```rust,no_run
+# #[cfg(feature = "redis")]
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 use actix_web_ratelimit::store::{FailurePolicy, RedisStore, RedisStoreOptions};
 use std::time::Duration;
@@ -227,7 +237,10 @@ for i in {1..5}; do echo "$(curl -s http://localhost:8080)\r"; done
 ```bash
 cargo test --locked --all-targets
 cargo test --locked --doc
-REDIS_URL=redis://127.0.0.1:6379/ cargo test --locked --test redis --test redis_transport -- --ignored
+cargo test --locked --all-targets --no-default-features
+cargo test --locked --doc --no-default-features
+cargo publish --locked --dry-run
+REDIS_URL=redis://127.0.0.1:6379/ cargo test --locked --all-targets --all-features -- --include-ignored
 cargo bench --locked --bench memory --no-default-features
 ```
 

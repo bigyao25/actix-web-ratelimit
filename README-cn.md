@@ -19,6 +19,8 @@
 - **可定制**: 支持自定义客户端识别和限流处理
 - **线程安全**: 使用 DashMap 实现并发请求处理
 
+需要 Rust 1.89 或更新版本。Redis 集成测试覆盖 Redis 7 和 8。
+
 ## 快速开始
 
 在你的 `Cargo.toml` 中添加：
@@ -37,7 +39,9 @@ actix-web-ratelimit = { version = "0.2", default-features = false }
 
 ```rust,no_run
 # use actix_web::{web, App, HttpResponse, HttpServer};
-# use actix_web_ratelimit::{RateLimit, config::RateLimitConfig, store::{MemoryStore, RedisStore}};
+# use actix_web_ratelimit::{RateLimit, config::RateLimitConfig, store::MemoryStore};
+# #[cfg(feature = "redis")]
+# use actix_web_ratelimit::store::RedisStore;
 # use std::sync::Arc;
 # async fn example() -> std::io::Result<()> {
 # async fn index() -> HttpResponse { HttpResponse::Ok().finish() }
@@ -62,7 +66,9 @@ actix-web-ratelimit = { version = "0.2", default-features = false }
 
 ```rust,no_run
 # use actix_web::{web, App, HttpResponse, HttpServer};
-# use actix_web_ratelimit::{RateLimit, config::RateLimitConfig, store::{MemoryStore, RedisStore}};
+# use actix_web_ratelimit::{RateLimit, config::RateLimitConfig, store::MemoryStore};
+# #[cfg(feature = "redis")]
+# use actix_web_ratelimit::store::RedisStore;
 # use std::sync::Arc;
 # async fn example() -> std::io::Result<()> {
 # async fn index() -> HttpResponse { HttpResponse::Ok().finish() }
@@ -110,8 +116,11 @@ actix-web-ratelimit = { version = "0.2", features = [ "redis" ] }
 
 ```rust,no_run
 # use actix_web::{web, App, HttpResponse, HttpServer};
-# use actix_web_ratelimit::{RateLimit, config::RateLimitConfig, store::{MemoryStore, RedisStore}};
+# use actix_web_ratelimit::{RateLimit, config::RateLimitConfig, store::MemoryStore};
+# #[cfg(feature = "redis")]
+# use actix_web_ratelimit::store::RedisStore;
 # use std::sync::Arc;
+# #[cfg(feature = "redis")]
 # async fn example() -> std::io::Result<()> {
 # async fn index() -> HttpResponse { HttpResponse::Ok().finish() }
     let store = Arc::new(
@@ -137,6 +146,7 @@ actix-web-ratelimit = { version = "0.2", features = [ "redis" ] }
 `RedisStore::new(url).await` 默认使用 1 秒超时和 `FailurePolicy::FailOpen`：Redis 出错时放行。可以使用 `with_options` 配置超时，并在后端失败时返回 HTTP 503：
 
 ```rust,no_run
+# #[cfg(feature = "redis")]
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 use actix_web_ratelimit::store::{FailurePolicy, RedisStore, RedisStoreOptions};
 use std::time::Duration;
@@ -227,7 +237,10 @@ for i in {1..5}; do echo "$(curl -s http://localhost:8080)\r"; done
 ```bash
 cargo test --locked --all-targets
 cargo test --locked --doc
-REDIS_URL=redis://127.0.0.1:6379/ cargo test --locked --test redis --test redis_transport -- --ignored
+cargo test --locked --all-targets --no-default-features
+cargo test --locked --doc --no-default-features
+cargo publish --locked --dry-run
+REDIS_URL=redis://127.0.0.1:6379/ cargo test --locked --all-targets --all-features -- --include-ignored
 cargo bench --locked --bench memory --no-default-features
 ```
 

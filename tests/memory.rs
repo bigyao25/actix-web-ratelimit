@@ -98,3 +98,41 @@ async fn shared_and_boxed_trait_objects_delegate_to_the_same_state() {
     assert!(!boxed.is_limited("a", &config).await.unwrap());
     assert!(store.is_limited("a", &config).await.unwrap());
 }
+
+#[test]
+fn concurrent_sweeps_preserve_active_quotas() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let store = Arc::new(MemoryStore::new());
+    let barrier = Arc::new(Barrier::new(9));
+    let admitted: Arc<[AtomicUsize; 8]> = Arc::new(std::array::from_fn(|_| AtomicUsize::new(0)));
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let (store, barrier, admitted) = (store.clone(), barrier.clone(), admitted.clone());
+        handles.push(std::thread::spawn(move || {
+            let config = RateLimitConfig::default().max_requests(50);
+            barrier.wait();
+            for i in 0..1_000 {
+                let key = i % 8;
+                if !store
+                    .is_limited(&key.to_string(), &config)
+                    .now_or_never()
+                    .unwrap()
+                    .unwrap()
+                {
+                    admitted[key].fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }));
+    }
+    barrier.wait();
+    for _ in 0..1_000 {
+        assert_eq!(store.prune_expired(), 0);
+        std::thread::yield_now();
+    }
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    for count in admitted.iter() {
+        assert_eq!(count.load(Ordering::SeqCst), 50);
+    }
+}

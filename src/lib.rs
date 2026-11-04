@@ -44,7 +44,7 @@ pub mod config;
 pub mod store;
 
 // Compile both READMEs as doctests so their public API examples cannot silently drift.
-#[cfg(all(doctest, feature = "redis"))]
+#[cfg(doctest)]
 mod readme_examples {
     #[doc = include_str!("../README.md")]
     struct English;

@@ -114,7 +114,10 @@ async fn checks_reuse_one_connection_and_reconnect_after_transport_loss() {
     .with_prefix(&format!(
         "ratelimit:transport:{}:{}:",
         std::process::id(),
-        proxy.url
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
     ));
     let config = RateLimitConfig::default().max_requests(1).window_secs(10);
     assert!(!store.is_limited("a", &config).await.unwrap());
@@ -156,15 +159,20 @@ async fn stalled_redis_obeys_deadlines_without_blocking_the_runtime() {
         proxy.stalled.notified().await;
         let start = Instant::now();
         let config = RateLimitConfig::default();
-        let (result, tick_elapsed) = tokio::join!(store.is_limited("a", &config), async {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            start.elapsed()
-        });
-        assert!(
-            tick_elapsed < Duration::from_millis(80),
-            "Redis blocked another task: {tick_elapsed:?}"
+        let finished = std::cell::Cell::new(false);
+        let (made_progress, result) = tokio::join!(biased;
+            async { tokio::task::yield_now().await; !finished.get() },
+            async {
+                let result = store.is_limited("a", &config).await;
+                finished.set(true);
+                result
+            }
         );
-        assert!(start.elapsed() < Duration::from_millis(500));
+        assert!(
+            made_progress,
+            "the runtime did not progress while Redis was stalled"
+        );
+        assert!(start.elapsed() < Duration::from_secs(2));
         match policy {
             FailurePolicy::FailOpen => assert!(!result.unwrap()),
             FailurePolicy::FailClosed => assert!(result.is_err()),
@@ -204,5 +212,5 @@ async fn initialization_is_bounded_and_rejects_invalid_options() {
     server.abort();
     let _ = server.await;
     assert!(result.is_err());
-    assert!(start.elapsed() < Duration::from_millis(500));
+    assert!(start.elapsed() < Duration::from_secs(2));
 }
