@@ -35,16 +35,18 @@ class PlanTest(unittest.TestCase):
 
 
 class CompetitorPlanTest(unittest.TestCase):
-    def test_expanded_ci_smoke_has_thirteen_cells(self):
-        cmd=[sys.executable,str(CLI),'smoke','--resources','ci','--variants','baseline','head','v0.1.2','v0.2.1','governor','trypema','extensible','--plan']
+    def test_smoke_excludes_historical_performance_duplicates(self):
+        cmd=[sys.executable,str(CLI),'smoke','--resources','ci','--variants','baseline','head','governor','trypema','extensible','--plan']
         plan=json.loads(subprocess.check_output(cmd,text=True))
-        self.assertEqual(plan['rounds'],13)
+        self.assertEqual(plan['rounds'],9)
 
     def test_comparison_defaults_are_high_load_and_dedicated(self):
         plan=json.loads(subprocess.check_output([sys.executable,str(CLI),'compare','--plan'],text=True))
-        self.assertEqual(plan['rounds'],135)
-        self.assertEqual(plan['rates'],[10000,30000,60000])
-        self.assertEqual(plan['load_seconds'],3375)
+        self.assertEqual(plan['rounds'],110)
+        self.assertEqual(plan['rates_by_backend'],{'memory':[30000,60000],'redis':[15000,20000,25000]})
+        self.assertEqual(plan['load_seconds'],3850)
+        self.assertEqual(plan['concurrency'],[512])
+        self.assertEqual(plan['repeats'],5)
 
     def test_comparison_does_not_use_shared_smoke_resources(self):
         result=subprocess.run([sys.executable,str(CLI),'compare','--resources','ci','--plan'],capture_output=True,text=True)
@@ -54,3 +56,11 @@ class CompetitorPlanTest(unittest.TestCase):
         result=subprocess.run([sys.executable,str(CLI),'compare','--rates','100001','--plan'],capture_output=True,text=True)
         self.assertNotEqual(result.returncode,0)
         self.assertIn('100000',result.stderr)
+
+    def test_legacy_is_a_one_shot_defect_proof(self):
+        plan=json.loads(subprocess.check_output([sys.executable,str(CLI),'defect','--resources','ci','--plan'],text=True))
+        self.assertEqual(plan['rounds'],1)
+        self.assertEqual(plan['load_seconds'],1)
+        result=subprocess.run([sys.executable,str(CLI),'compare','--variants','v0.1.2','--plan'],capture_output=True,text=True)
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('one-shot defect',result.stderr)

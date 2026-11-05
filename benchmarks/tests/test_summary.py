@@ -1,5 +1,4 @@
 """Assessment must distinguish missing data, expected defects and capacity evidence."""
-import importlib.util
 import json
 from pathlib import Path
 import sys
@@ -96,3 +95,17 @@ class QualitySummaryTest(unittest.TestCase):
         self.assertIn('measurement-clean: **1**',content)
         self.assertIn('Clean rounds failing load criteria: **1**',content)
         self.assertIn('In-flight bounds were reached',content)
+
+
+class DefectSummaryTest(unittest.TestCase):
+    def test_expected_defect_has_no_performance_next_step(self):
+        row=SummaryTest().fixture()
+        row.update(variant='v0.1.2',quota_exceeded=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            folder=Path(tmp)
+            (folder/'raw.json').write_text(json.dumps({'rounds':[row]}))
+            (folder/'environment.json').write_text(json.dumps({'profile':{'profile':'defect'}}))
+            content=summary.render(folder,'completed')
+        self.assertIn('historical defect reproduced',content)
+        self.assertIn('one-shot historical defect proof',content)
+        self.assertNotIn('use a bounded local',content)

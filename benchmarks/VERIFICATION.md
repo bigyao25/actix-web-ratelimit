@@ -81,7 +81,7 @@ behavior suite; manually dispatched CI smoke adds both new competitors. The
 benchmark workflow has no automatic push or pull-request trigger.
 
 
-## High-load high-load comparison revision
+## High-load comparison revision
 
 Low-load behavior entry points were removed. Manual Workflow defaults to `compare`,
 using a native Rust/Tokio pooled HTTP/1.1 generator with bounded tasks/histograms.
@@ -125,3 +125,97 @@ schema 3 remain visible and exclude the rate/cost comparison without invalidatin
 the measurement. Errors, scheduler loss, OOM and bad accounting still invalidate.
 Old schema-2 raw results are not rewritten. high-load comparison persists and aborts if a baseline
 measurement is invalid, preventing a long matrix after failed client calibration.
+
+## Driver queue, runtime and legacy-proof follow-up
+
+New measurements separate reserved slots, not-yet-started tasks and active HTTP
+exchanges; submission/executor wait histograms and fixed-1ms dispatch counts make
+client bursts visible. An initial 30k RPS baseline/HEAD Memory probe observed
+queued peaks of 120/97. The driver now bounds that queue at sixteen while retaining
+original due timestamps, the scheduler-loss check and complete drop accounting.
+No request retries or limiter changes were introduced.
+
+With the bounded queue and 128 slots, two 10-second Memory cells had zero
+transport/scheduler errors; baseline completed all 300,000 requests and HEAD had
+18 capacity drops. A separate 15k RPS Redis probe observed capacity drops even
+on the HTTP baseline. These are diagnostics, not proof of a limiter capacity.
+
+The subsequent baseline/HEAD calibration used the same 512-slot bound for all
+peers: Memory 30k RPS and Redis 15k RPS, two-second warmup and ten-second
+measurement. All four cells returned every scheduled request: 900,000 HTTP 200s
+in total, zero errors, zero capacity/scheduler drops, no OOM. Queued peaks stayed
+at sixteen. This bound is now the comparison default. Single local repetitions,
+dirty working trees and different slot bounds do not establish a speedup,
+capacity ranking or equivalence to earlier 128-slot measurements.
+
+Scoped streaming Docker stats samples parsed as JSON after removal of terminal
+control sequences. Docker inspect confirmed disjoint CPU sets, 2/1/1 CPU quotas
+and 512MiB/1GiB/512MiB memory/swap bounds for loadgen/server/Redis. Containers and
+networks created by these probes were removed; images, build caches and ignored
+result files remain for reuse. Production sources, crate dependencies and normal
+CI configuration are unchanged.
+
+The single historical proof sent six sequential Memory requests with quota five:
+v0.1.2 admitted six, zero transport errors. The expected quota/correctness defect
+was reproduced and excluded from performance comparison. Normal matrices omit
+this version; manual workflow suite `defect` runs this one-second proof once.
+
+The default comparison is now 110 rounds / 2750 seconds of planned load, versus
+135 / 3375 previously: 18.5% less load time without removing five repetitions.
+Memory uses 30k/60k and Redis 15k/20k/25k; these remain tested offered levels, not
+known capacities. Continuous stats, dependency-free loadgen startup after health
+checks and shorter post-measurement stop grace reduce orchestration waits.
+Only the obsolete low-load behavior assertion was removed; protocol, real idle
+close, accounting, resource, report and cleanup checks remain. Forty-two Python
+tool tests and seven native generator tests passed. The existing crate suite
+also passed: 38 unit/integration/doc tests, with 14 tests skipped by their original
+ignore attributes (including external-Redis tests).
+Workflow remains manual-only and passed actionlint. A full repeated competitor
+matrix on GitHub has not been rerun in this follow-up.
+
+## Backend matrix, probe/confirmation campaign and workload verdicts
+
+The manual workflow now prepares tooling once, runs Memory/Redis as two bounded
+independent hosted-runner jobs, and indexes uniquely named artifacts without
+pooling raw measurements. Products and repeat blocks remain serial and colocated
+within each backend. One shard failure preserves its artifacts and leaves the
+other running. Smoke and the one-shot legacy proof each remain a single job.
+Actionlint passes; the remote matrix itself has not been executed locally or
+dispatched to GitHub.
+
+The campaign probes high offered levels, selects common and product-specific
+confirmation candidates on that same host, then uses 30-second measurements and
+five repeats. Probe observations never qualify as confirmation evidence. A scoped
+sustained-load winner needs five clean passes versus five clean overload outcomes
+at a common tested rate; mixed/error outcomes stay inconclusive. Matched cost
+results use explicitly limited, approximate paired log-ratio intervals and baseline
+A/A noise/practical margins. Unaligned CPU counters or capture skew above 2% block
+a directional CPU result. Different algorithms retain their distinct guarantees.
+
+Native phase handshakes now bracket server/Redis counters after warmup and after
+measurement, with paused traffic and recorded capture overhead. The collector also
+records CPU model and allowlisted GitHub/Runner identifiers. Formal fixed-matrix
+defaults now use 30 seconds so their duration meets the confirmation criterion.
+
+Actual local Docker verification used the native 2/1/1-CPU layout:
+
+- Nine 15k RPS cells across baseline/HEAD/governor/trypema/extensible and every
+  supported Memory/Redis backend: 1-second warmup, 3-second measurement, all
+  405,000 requests returned HTTP 200, zero errors/drops/OOM.
+- A real `campaign.py --check` ran baseline/HEAD probing, candidate selection,
+  confirmation and collection on Memory: four 2-second cells at 15k RPS,
+  120,000 HTTP 200s, zero errors/drops/OOM. Its report explicitly marks operational
+  checking, leaves workload verdicts empty and does not qualify its short repeats.
+- A final 2-second baseline verified the complete resource-bracket timing and
+  Mac CPU-model collection: 30,000 HTTP 200s, zero errors/drops/OOM. Capture
+  overhead was recorded rather than hidden in the measurement duration.
+
+All fourteen short cells are diagnostic evidence from a dirty tree, not a
+five-repeat competitor result or an observed performance improvement. The seven
+native tests passed in the Docker build. Fifty-five Python tool tests pass,
+including cross-host/source-change rejection, phase protocol failure, candidate
+selection, missing artifacts, unmatched settings and refusing false winners.
+Production sources/dependencies, existing project tests and the normal CI workflow
+remain unchanged. No rlbench containers or networks remained after verification;
+images, caches and ignored reports were retained. No commit, push or workflow
+dispatch was performed.

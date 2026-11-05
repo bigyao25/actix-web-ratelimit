@@ -6,6 +6,7 @@ services:
     cpuset: ${REDIS_CPUSET:-3}
     mem_limit: 512m
     memswap_limit: 512m
+    stop_grace_period: 2s
     pids_limit: 64
     healthcheck:
       test: [CMD, redis-cli, ping]
@@ -18,6 +19,7 @@ services:
     cpuset: ${SERVER_CPUSET:-1,2}
     mem_limit: 1g
     memswap_limit: 1g
+    stop_grace_period: 2s
     pids_limit: 128
     environment:
       BACKEND: ${BACKEND}
@@ -35,6 +37,7 @@ services:
     memswap_limit: 512m
     pids_limit: 600
     environment:
+      PHASE_BARRIER: ${PHASE_BARRIER:-0}
       LIMIT: ${LIMIT}
       RATE: ${RATE}
       CONCURRENCY: ${CONCURRENCY}

@@ -68,6 +68,7 @@ def load_failures(row):
     reasons=[]
     if row.get('dropped_capacity',0)>0: reasons.append('in-flight limit reached')
     if row.get('workload') in ('comparison','pk'):
+        if '/allow/' in row.get('scenario','') and row.get('http_429',0)>0: reasons.append('unexpected rejection in all-allow workload')
         if row.get('http_rps',row.get('achieved_rps',0))<.99*row.get('target_rps',1): reasons.append('HTTP completion below 99%')
         if (row.get('scheduled_latency',{}).get('p99_ms') or float('inf'))>10: reasons.append('scheduled p99 above 10ms')
         if row.get('loadgen_cpu_pct',float('inf'))>=85*row.get('loadgen_cpu_limit',1): reasons.append('loadgen CPU pressure')
@@ -131,12 +132,12 @@ def markdown(result):
     lines += ['', '## Raw rounds (including invalid runs)', '', '| Variant | Scenario | Target RPS | Offered RPS | Achieved RPS | 200 | 429 | 503 | Valid |', '| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |']
     for r in result['rounds']:
         lines.append('| '+' | '.join(str(r.get(k,'N/A')).replace('|','/').replace('\n',' ') for k in ('variant','scenario','target_rps','offered_rps','achieved_rps','http_200','http_429','http_503'))+' | '+str(not r['invalid_reasons'])+' |')
-    lines += ['', '## Resource diagnostics', '', '| Variant / scenario | Server CPU % (100 = one core) | Server RSS bytes | Server peak bytes | Loadgen peak bytes | Redis bytes | Redis connections |', '| --- | ---: | ---: | ---: | ---: | ---: | ---: |']
+    lines += ['', '## Resource diagnostics', '', '| Variant / scenario | Server CPU % (100 = one core) | Server RSS bytes | Server peak bytes | Loadgen peak bytes | Redis bytes | Redis connections | Resource phase | Capture skew seconds |', '| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | ---: |']
     for r in result['rounds']:
-        lines.append('| '+str(r.get('variant','unknown'))+' / '+str(r.get('scenario','unknown'))+' | '+' | '.join(str(r.get(k,'N/A')) for k in ('server_cpu_pct','server_rss_bytes','memory_peak_bytes','loadgen_peak_bytes','redis_memory_bytes','redis_connections'))+' |')
+        lines.append('| '+str(r.get('variant','unknown'))+' / '+str(r.get('scenario','unknown'))+' | '+' | '.join(str(r.get(k,'N/A')) for k in ('server_cpu_pct','server_rss_bytes','memory_peak_bytes','loadgen_peak_bytes','redis_memory_bytes','redis_connections','resource_phase','resource_capture_skew_seconds'))+' |')
     lines += ['', '## Measurement quality', '',
               'Latency percentiles describe sent requests; scheduled latency also includes dispatch lag. Dropped arrivals are counted separately.',
-              'Server CPU samples include startup/warmup and sampling overhead; loadgen CPU deltas cover measurement only.',
+              'Native compare brackets server/Redis CPU reads around measurement with paused traffic; capture skew is recorded. Other/legacy CPU samples include warmup and sampling overhead. Loadgen CPU deltas cover measurement only.',
               'Legacy report RSS may be anonymous-memory estimates. See schema_version and the recorded collector source.', '',
               '| Variant / scenario | Samples per round (min) | p99 range ms | Warnings |',
               '| --- | ---: | --- | --- |']

@@ -28,10 +28,6 @@ class ReportTest(unittest.TestCase):
         self.assertTrue(report.validate({**self.round, "http_503": 1}))
         self.assertTrue(report.validate({**self.round, "p99_ms": 0}))
 
-
-if __name__ == "__main__":
-    unittest.main()
-
 class OutputTest(unittest.TestCase):
     def test_all_invalid_report_still_renders(self):
         result = report.summarize({'rounds': [{'variant': 'legacy', 'quota_exceeded': True}]})
@@ -99,3 +95,7 @@ class SchemaThreeTest(unittest.TestCase):
         self.assertTrue(report.invalid_comparison_baseline(row))
         row['variant']='head'
         self.assertFalse(report.invalid_comparison_baseline(row))
+
+
+if __name__ == "__main__":
+    unittest.main()

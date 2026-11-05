@@ -1,7 +1,7 @@
 //! Bounded open-loop HTTP/1.1 load generator, with persistent pooled connections.
 use serde_json::{Value, json};
 use std::{
-    io,
+    io::{self, Write},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -18,6 +18,7 @@ use tokio::{
 type Connection = BufReader<TcpStream>;
 type Pool = Arc<ConnectionPool>;
 const BINS: usize = 80001;
+const QUEUED_TASK_LIMIT: usize = 16;
 #[derive(Clone)]
 struct Histogram {
     bins: Vec<u64>,
@@ -222,6 +223,8 @@ struct Observation {
     lag: u64,
     end: Instant,
     error: Option<ClientError>,
+    executor_wait: u64,
+    submission_lag: u64,
 }
 struct Results {
     latency: Histogram,
@@ -233,6 +236,8 @@ struct Results {
     admitted: Vec<usize>,
     count: u64,
     latency_sum: u128,
+    executor_wait: Histogram,
+    submission_lag: Histogram,
     completed: u64,
     error_categories: std::collections::BTreeMap<String, u64>,
     error_examples: Vec<Value>,
@@ -249,6 +254,8 @@ impl Results {
             admitted: vec![0; clients],
             count: 0,
             latency_sum: 0,
+            executor_wait: Histogram::new(),
+            submission_lag: Histogram::new(),
             completed: 0,
             error_categories: Default::default(),
             error_examples: Vec::new(),
@@ -271,6 +278,8 @@ impl Results {
         self.statuses[index] += 1;
         self.latency.add(r.latency);
         self.lag.add(r.lag);
+        self.executor_wait.add(r.executor_wait);
+        self.submission_lag.add(r.submission_lag);
         self.scheduled_latency.add(r.latency + r.lag);
         if index < 3 {
             self.status_latency[index].add(r.latency);
@@ -300,6 +309,10 @@ async fn phase(
     let permits = Arc::new(Semaphore::new(concurrency));
     let active = Arc::new(AtomicUsize::new(0));
     let peak = Arc::new(AtomicUsize::new(0));
+    let queued = Arc::new(AtomicUsize::new(0));
+    let (mut peak_queued, mut peak_reserved) = (0, 0);
+    let (mut bin_ms, mut bin_count, mut peak_dispatches) = (0, 0, 0);
+    let mut dispatched = 0usize;
     let mut tasks = JoinSet::new();
     let mut results = Results::new(clients);
     let (mut late, mut capacity) = (0, 0);
@@ -307,6 +320,13 @@ async fn phase(
     for i in 0..scheduled {
         let due = start + Duration::from_secs_f64(i as f64 / rate as f64);
         sleep_until(due).await;
+        // Bound tasks waiting for their first poll separately from active exchanges.
+        // Keep the original due time: executor pressure remains visible in lag/loss.
+        while queued.load(Ordering::Relaxed) >= QUEUED_TASK_LIMIT
+            && Instant::now().saturating_duration_since(due) <= Duration::from_millis(100)
+        {
+            tokio::task::yield_now().await;
+        }
         while let Some(result) = tasks.try_join_next() {
             results.add(result.expect("load worker panicked"), deadline, start);
         }
@@ -315,15 +335,29 @@ async fn phase(
             continue;
         }
         let Ok(permit) = permits.clone().try_acquire_owned() else {
+            peak_reserved = concurrency;
             capacity += 1;
             continue;
         };
+        let submitted = Instant::now();
+        let ms = submitted.saturating_duration_since(start).as_millis();
+        if ms != bin_ms {
+            bin_ms = ms;
+            bin_count = 0;
+        }
+        bin_count += 1;
+        peak_dispatches = peak_dispatches.max(bin_count);
+        peak_reserved = peak_reserved.max(concurrency - permits.available_permits());
+        let queued_count = queued.fetch_add(1, Ordering::Relaxed) + 1;
+        peak_queued = peak_queued.max(queued_count);
+        let queued = queued.clone();
         let (pool, active, peak) = (pool.clone(), active.clone(), peak.clone());
         let client = i as usize % clients;
         let identity = format!("{prefix}-{client}");
         tasks.spawn(async move {
             let _permit = permit;
             let begin = Instant::now();
+            queued.fetch_sub(1, Ordering::Relaxed);
             let current = active.fetch_add(1, Ordering::Relaxed) + 1;
             peak.fetch_max(current, Ordering::Relaxed);
             let (status, error) = match tokio::time::timeout(
@@ -345,8 +379,15 @@ async fn phase(
                 lag: begin.saturating_duration_since(due).as_micros() as u64,
                 end,
                 error,
+                executor_wait: begin.saturating_duration_since(submitted).as_micros() as u64,
+                submission_lag: submitted.saturating_duration_since(due).as_micros() as u64,
             }
         });
+        dispatched += 1;
+        // Let ready socket tasks run during catch-up, instead of reserving the whole cap.
+        if dispatched % QUEUED_TASK_LIMIT == 0 {
+            tokio::task::yield_now().await;
+        }
     }
     sleep_until(deadline).await;
     while let Some(result) = tasks.join_next().await {
@@ -365,6 +406,10 @@ async fn phase(
         "max_admissions_per_client":results.admitted.iter().max().unwrap_or(&0),"expected_admissions":results.attempts.iter().map(|n|(*n).min(limit)).sum::<usize>(),
         "clients_observed":results.attempts.iter().filter(|n|**n>0).count(),"dispatch_lag":results.lag.json(),"scheduled_latency":results.scheduled_latency.json(),
         "status_latency":{"200":results.status_latency[0].json(),"429":results.status_latency[1].json(),"503":results.status_latency[2].json()}});
+    let dispatch = json!({"queued_task_limit":QUEUED_TASK_LIMIT,"peak_reserved_slots":peak_reserved,"peak_queued_tasks":peak_queued,"peak_dispatches_per_1ms_bin":peak_dispatches,"executor_wait":results.executor_wait.json(),"submission_lag":results.submission_lag.json()});
+    r.as_object_mut()
+        .unwrap()
+        .extend(dispatch.as_object().unwrap().clone());
     for key in ["p50_ms", "p95_ms", "p99_ms"] {
         r[key] = results.latency.json()[key].clone();
     }
@@ -393,6 +438,18 @@ fn cgroup() -> Value {
         );
     }
     Value::Object(map)
+}
+fn phase_barrier(event: &str) {
+    if number("PHASE_BARRIER", 0) == 1 {
+        println!("{}", json!({"event":event}));
+        io::stdout().flush().expect("flush phase event");
+        let mut line = String::new();
+        assert!(
+            io::stdin().read_line(&mut line).unwrap() > 0,
+            "phase controller disconnected"
+        );
+        assert_eq!(line.trim(), event, "unexpected phase acknowledgement");
+    }
 }
 #[tokio::main(worker_threads = 2)]
 async fn main() {
@@ -428,10 +485,12 @@ async fn main() {
     let (warmup, duration) = (number("WARMUP", 5), number("DURATION", 20));
     assert!(warmup <= 15 && (1..=60).contains(&duration));
     phase(warmup, rate, concurrency, clients, "warmup", limit).await;
+    phase_barrier("measurement_ready");
     let before = cgroup();
     let mut result = phase(duration, rate, concurrency, clients, "measure", limit).await;
     result["loadgen_cgroup_before"] = before;
     result["loadgen_cgroup"] = cgroup();
+    phase_barrier("measurement_complete");
     println!("{result}");
 }
 #[cfg(test)]
@@ -453,6 +512,9 @@ mod tests {
         let r = phase(0, 100, 32, 1, "warmup", 20).await;
         assert_eq!(r["sample_count"], 0);
         assert_eq!(r["achieved_rps"], 0.0);
+        assert_eq!(r["peak_reserved_slots"], 0);
+        assert_eq!(r["peak_queued_tasks"], 0);
+        assert_eq!(r["peak_dispatches_per_1ms_bin"], 0);
     }
     #[tokio::test]
     async fn client_reuses_framed_connection_and_reads_chunked_body() {
@@ -593,6 +655,8 @@ mod tests {
                     lag: 0,
                     end: start,
                     error: Some(ClientError::protocol("read_status", "eof")),
+                    executor_wait: 0,
+                    submission_lag: 0,
                 },
                 start,
                 start,

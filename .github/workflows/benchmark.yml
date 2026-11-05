@@ -3,42 +3,73 @@ on:
   workflow_dispatch:
     inputs:
       suite:
-        description: 'High-load comparative benchmarks (4 CPUs) or short operational smoke'
+        description: 'High-load comparison (4 CPUs), operational smoke, or one-shot legacy defect'
         required: true
         default: compare
         type: choice
-        options: [compare, smoke]
+        options: [compare, smoke, defect]
 permissions:
   contents: read
 concurrency:
   group: benchmark-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Test benchmark tooling once
+        run: python3 -W error::ResourceWarning -m unittest discover -s benchmarks/tests -v
+      - name: Plan backend shards
+        id: matrix
+        env:
+          BENCHMARK_SUITE: ${{ inputs.suite }}
+        run: python3 benchmarks/workflow.py plan --suite "$BENCHMARK_SUITE" --github-output
   benchmark:
+    name: Benchmark (${{ matrix.shard }})
+    needs: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
           fetch-depth: 0
-      - name: Test benchmark tooling
-        run: python3 -m unittest discover -s benchmarks/tests -v
-      - name: Build and run bounded comparison
+      - name: Build, probe and confirm on the same runner
         id: benchmark
         env:
           BENCHMARK_SUITE: ${{ inputs.suite }}
+          BENCHMARK_BACKENDS: ${{ matrix.backends }}
         run: |
           mkdir -p benchmarks/results/ci
-          set -o pipefail
+          set -euo pipefail
           if [ "$BENCHMARK_SUITE" = compare ]; then
-            resource=comparison
-            variants=(baseline head governor trypema extensible)
+            python3 benchmarks/campaign.py --backend "$BENCHMARK_BACKENDS" --output benchmarks/results/ci 2>&1 | tee benchmarks/results/ci/run.log
+            exit 0
+          elif [ "$BENCHMARK_SUITE" = defect ]; then
+            resource=ci
+            variants=(v0.1.2)
+            backends=(memory)
           else
             resource=ci
-            variants=(baseline head v0.1.2 v0.2.1 governor trypema extensible)
+            variants=(baseline head governor trypema extensible)
+            backends=(memory redis)
           fi
-          python3 benchmarks/bench.py "$BENCHMARK_SUITE" --resources "$resource" --variants "${variants[@]}" --backends memory redis --output benchmarks/results/ci 2>&1 | tee benchmarks/results/ci/run.log
+          python3 benchmarks/bench.py "$BENCHMARK_SUITE" --resources "$resource" --variants "${variants[@]}" --backends "${backends[@]}" --output benchmarks/results/ci 2>&1 | tee benchmarks/results/ci/run.log
+      - name: Record shard outcome
+        if: always()
+        env:
+          BENCHMARK_STATUS: ${{ steps.benchmark.outcome }}
+        run: python3 benchmarks/workflow.py status benchmarks/results/ci --outcome "$BENCHMARK_STATUS"
       - name: Generate assessment even on failure
         if: always()
         env:
@@ -49,7 +80,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: benchmark-diagnostics
+          name: benchmark-diagnostics-${{ matrix.shard }}
           path: benchmarks/results/ci/
           retention-days: 14
           if-no-files-found: warn
@@ -59,3 +90,30 @@ jobs:
           BENCHMARK_STATUS: ${{ steps.benchmark.outcome }}
           BENCHMARK_ARTIFACT_URL: ${{ steps.artifact.outputs.artifact-url }}
         run: python3 benchmarks/summary.py benchmarks/results/ci --status "$BENCHMARK_STATUS" --output benchmarks/results/ci/assessment.md --github-summary
+  overview:
+    name: Collect backend reports
+    needs: [prepare, benchmark]
+    if: ${{ always() && needs.prepare.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: benchmark-diagnostics-*
+          path: benchmarks/results/shards
+          merge-multiple: false
+      - name: Index independent measurements
+        if: always()
+        env:
+          BENCHMARK_SUITE: ${{ inputs.suite }}
+        run: python3 benchmarks/workflow.py aggregate benchmarks/results/shards --suite "$BENCHMARK_SUITE" --output benchmarks/results/overview --github-summary
+      - name: Upload workflow overview
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-overview
+          path: benchmarks/results/overview/
+          retention-days: 14

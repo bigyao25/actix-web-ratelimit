@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import report
 import comparison
+import verdicts
 
 
 def expected_historical(round_):
@@ -53,7 +54,7 @@ def render(folder, status='unknown', artifact_url=''):
     fmt=lambda v: 'N/A' if v is None else f'{v:.2f}'
     lines=['# Benchmark assessment','',f'Execution status: **{esc(status)}**.',
            f'Completed rounds: **{len(rows)}**; measurement-clean: **{len(valid)}**; expected historical defects: **{len(expected)}**; other invalid: **{len(unexpected)}**.','']
-    quality='no data' if not rows else 'failed' if not valid else 'partial' if unexpected else 'clean'
+    quality='no data' if not rows else 'historical defect reproduced' if len(expected)==len(rows) else 'failed' if not valid else 'partial' if unexpected else 'clean'
     lines += [f'Measurement quality: **{quality}**. Clean rounds failing load criteria: **{len(load_failed)}**. Execution success alone does not qualify a workload.','']
     if not rows:
         lines += ['**No benchmark data collected.** Check build/preflight logs. No performance conclusion is available.','']
@@ -65,6 +66,8 @@ def render(folder, status='unknown', artifact_url=''):
             lines += ['v0.1.2 over-admission was observed and excluded from equivalent-correctness comparisons.','']
         if env.get('profile',{}).get('profile')=='smoke':
             lines += ['**CI smoke: operational/correctness validation only.** Short single rounds cannot establish a performance regression or capacity limit.','']
+        if env.get('campaign',{}).get('operational_check'):
+            lines += ['**Campaign operational check only.** Short baseline/HEAD phases validate orchestration, not performance qualification or competitor winners.','']
     if env:
         profile=env.get('profile',{})
         lines += [f"Git: `{esc(env.get('git_sha','unknown'))}`; dirty: **{bool(env.get('dirty'))}**; profile: `{esc('compare' if profile.get('profile')=='pk' else profile.get('profile'))}`; resources: `{esc('comparison' if profile.get('resources')=='pk' else profile.get('resources','safe'))}`.",
@@ -72,16 +75,19 @@ def render(folder, status='unknown', artifact_url=''):
         if env.get('resource_layout',{}).get('shared_cpuset'):
             lines += ['CI shares CPU sets explicitly; these measurements are not comparable to the disjoint local Safe layout.','']
     if rows:
+        conclusions=verdicts.markdown(verdicts.analyze(rows))
+        if conclusions: lines += [conclusions,'']
         lines += ['## Observations','',
-                  '| Variant / scenario | Target / HTTP / attempts RPS | 200 / 429 / errors | Capacity / scheduler drops | Sent / scheduled p99 ms | Peak / mean in flight | Assessment |',
-                  '| --- | ---: | ---: | ---: | ---: | ---: | --- |']
+                  '| Stage | Variant / scenario | Target / HTTP / attempts RPS | 200 / 429 / errors | Capacity / scheduler drops | Sent / scheduled p99 ms | Peak / mean in flight | Assessment |',
+                  '| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |']
         for r in rows[:80]:
             error=sum(r.get(k,0) for k in ('http_503','http_other','errors'))
-            lines.append(f"| {esc(r.get('variant'))} / {esc(r.get('scenario'))} | {fmt(r.get('target_rps'))} / {fmt(r.get('http_rps'))} / {fmt(r.get('achieved_rps'))} | {r.get('http_200','N/A')} / {r.get('http_429','N/A')} / {error} | {r.get('dropped_capacity','N/A')} / {r.get('dropped_late','N/A')} | {fmt(r.get('p99_ms'))} / {fmt(r.get('scheduled_latency',{}).get('p99_ms'))} | {r.get('peak_in_flight','N/A')} / {fmt(r.get('mean_in_flight'))} | {esc(assess(r))} |")
+            lines.append(f"| {esc(r.get('campaign_stage','fixed'))} | {esc(r.get('variant'))} / {esc(r.get('scenario'))} | {fmt(r.get('target_rps'))} / {fmt(r.get('http_rps'))} / {fmt(r.get('achieved_rps'))} | {r.get('http_200','N/A')} / {r.get('http_429','N/A')} / {error} | {r.get('dropped_capacity','N/A')} / {r.get('dropped_late','N/A')} | {fmt(r.get('p99_ms'))} / {fmt(r.get('scheduled_latency',{}).get('p99_ms'))} | {r.get('peak_in_flight','N/A')} / {fmt(r.get('mean_in_flight'))} | {esc(assess(r))} |")
         if len(rows)>80:
             lines += ['', 'Table truncated; the artifact contains every round.']
         levels=collections.defaultdict(list)
         for r in valid:
+            if r.get('campaign_stage','confirm')!='confirm': continue
             if r.get('variant') not in ('governor','trypema','extensible') and not r['load_failure_reasons']:
                 levels[(r.get('variant'),r.get('scenario','').split('/')[0])].append(r.get('target_rps',0))
         if levels:
@@ -92,12 +98,18 @@ def render(folder, status='unknown', artifact_url=''):
         for r in rows:
             if r['invalid_reasons']:
                 lines += ['- '+esc(r.get('variant'))+' / '+esc(r.get('scenario'))+': '+esc(', '.join(r['invalid_reasons']))]
-        if any(r.get('variant')=='baseline' and r.get('errors',0)>0 for r in rows):
+        if env.get('profile',{}).get('profile')=='defect':
+            lines += ['- This is a one-shot historical defect proof, not a performance comparison. A reproduced quota defect is the expected outcome; no repeated historical load tests are needed.']
+        elif env.get('campaign',{}).get('operational_check'):
+            lines += ['- This short check validates stage orchestration. Use the manual compare workflow for five-repeat competitor confirmation; these rows cannot establish winners.']
+        elif any(r.get('variant')=='baseline' and r.get('errors',0)>0 for r in rows):
             lines += ['- Baseline also has transport errors: investigate shared client/pool/transport before attributing failures to limiters. Inspect categories and bounded error timestamps; do not hide failures by retrying.']
         elif any(r.get('dropped_capacity',0)>0 for r in rows):
             lines += ['- In-flight bounds were reached: these are overload observations, not proof of generator CPU saturation. Compare concurrency bounds and server/Redis CPU; do not blindly increase offered rate.']
         elif any('loadgen pressure' in assess(r) for r in rows):
             lines += ['- Increase generator efficiency before increasing offered rate; generator pressure prevents attributing the limit to the server.']
+        elif env.get('campaign'):
+            lines += ['- Review Workload verdicts and campaign-plan.json. An unbracketed or unconfirmed boundary remains unresolved; adjust the bounded probe grid and recalibrate on the next runner when necessary.']
         elif env.get('profile',{}).get('profile')=='explore':
             lines += ['- No boundary was demonstrated within this probe range. Confirm the highest level with longer repeats before considering any new resource/rate ceiling; the maximum remains unknown.']
         else:
@@ -106,29 +118,32 @@ def render(folder, status='unknown', artifact_url=''):
     if env.get('profile',{}).get('profile') in ('compare','pk'):
         groups=collections.defaultdict(list)
         for r in rows:
-            groups[(r.get('variant'),r.get('scenario'))].append(r)
+            if r.get('campaign_stage','confirm')!='confirm': continue
+            groups[(r.get('platform_id'),r.get('variant'),r.get('scenario'))].append(r)
         qualified=collections.defaultdict(list)
         lines += ['', '## High-load benchmark qualification','',
-                  'Same offered rates, workers, quotas and resource layout. A level qualifies only with at least five valid repeats, completion >=99% of offered load, scheduled p99 <=10ms, and loadgen CPU below 85% of its quota. Higher offered rate alone is not proof of server pressure.',
-                  'SUT cgroup throttling is expected enforcement of the fixed CPU budget in high-load comparison and is recorded, not treated as environmental corruption. OOM, transport errors and dropped arrivals remain invalid.','',
-                  '| Variant / scenario | Repeats | Qualified at this rate | Reason |', '| --- | ---: | --- | --- |']
-        for (variant,scenario),items in sorted(groups.items()):
+                  'Same offered rates, workers, quotas and resource layout. A level qualifies only with at least five valid repeats of at least 30 seconds, completion >=99% of offered load, scheduled p99 <=10ms, and loadgen CPU below 85% of its quota. Higher offered rate alone is not proof of server pressure.',
+                  'SUT cgroup throttling is expected enforcement of the fixed CPU budget in high-load comparison and is recorded, not treated as environmental corruption. OOM, transport errors and scheduler loss invalidate measurements; capacity drops block rate qualification.','',
+                  '| Host / variant / scenario | Repeats | Qualified at this rate | Reason |', '| --- | ---: | --- | --- |']
+        for (host,variant,scenario),items in sorted(groups.items(),key=lambda x:str(x[0])):
             checks=[(len(items)>=5,'fewer than five repeats'),
+                    (len({r.get('repeat') for r in items})==len(items),'duplicate or missing repeat IDs'),
+                    (all(r.get('measurement_seconds',0)>=30 for r in items),'confirmation shorter than 30 seconds'),
                     (all(not r['invalid_reasons'] for r in items),'measurement invalid'),
                     (all(r.get('dropped_capacity',0)==0 for r in items),'in-flight limit reached'),
                     (all(r.get('http_rps',r.get('achieved_rps',0))>=.99*r.get('target_rps',1) for r in items),'completion below 99%'),
                     (all((r.get('scheduled_latency',{}).get('p99_ms') or float('inf'))<=10 for r in items),'scheduled p99 above 10ms'),
                     (all(r.get('loadgen_cpu_pct',float('inf'))<85*r.get('loadgen_cpu_limit',1) for r in items),'loadgen CPU pressure')]
             passed=all(ok for ok,_ in checks)
-            if passed: qualified[(variant,scenario.split('/')[0],'/'.join(scenario.split('/')[1:-1]))].append(items[0]['target_rps'])
-            lines.append('| '+esc(str(variant)+' / '+str(scenario))+' | '+str(len(items))+' | '+str(passed)+' | '+esc('; '.join(reason for ok,reason in checks if not ok) or 'all criteria met')+' |')
+            if passed: qualified[(host,variant,scenario.split('/')[0],'/'.join(scenario.split('/')[1:-1]))].append(items[0]['target_rps'])
+            lines.append('| '+esc(str(host)+' / '+str(variant)+' / '+str(scenario))+' | '+str(len(items))+' | '+str(passed)+' | '+esc('; '.join(reason for ok,reason in checks if not ok) or 'all criteria met')+' |')
         lines += ['', 'Highest qualified tested level (not an unbounded maximum):','']
-        for (variant,backend,condition),rates in sorted(qualified.items(),key=lambda item:(item[0][1],item[0][2],-max(item[1]))):
-            lines.append('- '+esc(str(variant)+' / '+backend+' / '+condition)+': '+str(max(rates))+' RPS; policy guarantees remain different.')
-    contrasts=comparison.contrasts([r for r in valid if not r['load_failure_reasons']])
+        for (host,variant,backend,condition),rates in sorted(qualified.items(),key=lambda item:(str(item[0]),-max(item[1]))):
+            lines.append('- '+esc(str(host)+' / '+str(variant)+' / '+backend+' / '+condition)+': '+str(max(rates))+' RPS; policy guarantees remain different.')
+    contrasts=comparison.contrasts([r for r in valid if not r['load_failure_reasons'] and r.get('campaign_stage','confirm')=='confirm'])
     if contrasts:
         lines += ['', '## Competitor cost at matched workloads','',
-                  'Ratios are competitor / HEAD medians at identical recorded quotas/resources. Different algorithms provide different guarantees: these observations do not rank implementation efficiency. CPU spans warmup; RSS and Redis memory are snapshots, not normalized state-size estimates.',
+                  'Ratios are competitor / HEAD medians at identical recorded quotas/resources. Different algorithms provide different guarantees: these observations do not rank implementation efficiency. CPU follows recorded resource_phase; compare uses measurement boundaries with recorded capture skew. RSS and Redis memory are snapshots, not normalized state-size estimates.',
                   'At least five repeats and non-overlapping observed p99 ranges are needed for the descriptive separation label; this is not a confidence interval or significance test.','',
                   '| Competitor / scenario | Algorithm | Matched repeats | p99 ratio | Server CPU ratio | RSS ratio | Redis memory ratio | Evidence |',
                   '| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |']
@@ -142,6 +157,13 @@ def render(folder, status='unknown', artifact_url=''):
             pool=r.get('connection_pool',{})
             first=r.get('error_examples',[])
             lines.append('| '+esc(str(r.get('variant'))+' / '+str(r.get('scenario')))+' | '+esc(json.dumps(r.get('error_categories',{'legacy':'unknown'}),sort_keys=True))+' | '+str(first[0].get('phase_ms') if first else 'N/A')+' | '+' / '.join(str(pool.get(k,'N/A')) for k in ('created','reused','idle_expired','idle_unusable'))+' |')
+    if rows:
+        lines += ['', '## Driver scheduling diagnostics','',
+                  'Reserved slots include queued plus started tasks. Active peak counts started exchanges only; peaks need not occur simultaneously. Dispatch bins are fixed 1ms intervals.',
+                  '| Variant / scenario | Reserved / queued / active peak | Submission / executor wait p99 ms | Peak dispatches per 1ms bin |',
+                  '| --- | ---: | ---: | ---: |']
+        for r in rows[:80]:
+            lines.append('| '+esc(str(r.get('variant'))+' / '+str(r.get('scenario')))+' | '+' / '.join(str(r.get(k,'N/A')) for k in ('peak_reserved_slots','peak_queued_tasks','peak_in_flight'))+' | '+fmt(r.get('submission_lag',{}).get('p99_ms'))+' / '+fmt(r.get('executor_wait',{}).get('p99_ms'))+' | '+str(r.get('peak_dispatches_per_1ms_bin','N/A'))+' |')
     lines += ['', '## Files','', '`report.md`: full tables; `raw.json`: all rounds; `validated.json`: exclusions/statistics; `environment.json`: platform/limits/images; `run.log`: build and execution log.']
     if artifact_url:
         lines += ['', f'[Download benchmark diagnostics artifact]({artifact_url})']

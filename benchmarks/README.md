@@ -12,7 +12,7 @@ python3 -m unittest discover -s benchmarks/tests -v
 
 Formal runs reject a dirty working tree by default. `--allow-dirty` explicitly marks
 results non-reproducible. Commit the harness before producing formal measurements.
-`--skip-build` is allowed only for smoke and reuses images when the operator knows they match the source;
+`--skip-build` is allowed only for smoke/defect and reuses images when the operator knows they match the source;
 image IDs and architecture are recorded. Do not use it for a formal source comparison.
 
 Safe defaults: 15 s warmup, 60 s measurement, 5 repetitions, 1,000 target RPS.
@@ -173,7 +173,7 @@ SLO. Generator saturation invalidates server capacity comparisons. Confirm any
 candidate boundary using longer repeated runs. The Python generator may hit its
 own CPU limit first; increasing offered rate cannot resolve that ambiguity.
 
-The benchmark workflow runs **only by manual dispatch**, selecting **compare or smoke**, never explore. Pushes and pull requests do not trigger it.
+The benchmark workflow runs **only by manual dispatch**, selecting **compare, smoke or defect**, never explore. Pushes and pull requests do not trigger it.
 CI explicitly uses server=1 CPU, loadgen=0.5 CPU, Redis=0.5 CPU, one HTTP worker;
 memory/swap limits are unchanged. On 2-CPU runners the generator and Redis share
 CPU 0, and the server uses CPU 1. On >=3-CPU runners sets are disjoint. This sharing
@@ -213,12 +213,13 @@ manual suite. Pushes and pull requests never trigger this workflow. The obsolete
 low-load behavior suite has been removed. Optional `smoke` is only an operational
 check, not the competitor comparison result.
 
-high-load comparison compares baseline, HEAD, governor, trypema and extensible sequentially using the
-same Actix 4.18.1 stack and request workload. Defaults: 10k/30k/60k offered RPS,
-128 concurrency ceiling, one client, all-allow, 5 s warmup + 20 s measurement,
-five repetitions in alternating order, Memory and Redis. Unsupported backend cells
-are skipped by the published capability registry. Plan: 135 cells, 3375 seconds
-of load, plus compilation/startup/cleanup; the manual job timeout is 120 minutes.
+The workflow uses a two-stage campaign per backend (see below). The fixed-matrix
+`bench.py compare` entry point remains available: baseline, HEAD, governor, trypema
+and extensible on the same Actix 4.18.1 stack. Its defaults are Memory 30k/60k and
+Redis 15k/20k/25k offered RPS, 512 slots, one client, all-allow, 5 s warmup + 30 s
+measurement and five alternating-order repeats. Unsupported variants are filtered
+before building. This optional fixed matrix has 110 cells / 3850 seconds of load;
+the workflow instead selects confirmation cells from same-runner short probes.
 
 high-load comparison requires **four native Docker CPUs**: native Rust loadgen=2 CPUs (sets 0,1),
 server=1 CPU (set 2, one worker), Redis=1 CPU (set 3). Memory/swap limits remain
@@ -248,7 +249,7 @@ transport failures and asserted quota violations still invalidate measurement qu
 Schema-3 capacity-only drops fail load qualification and are excluded from matched cost ratios; they do not invalidate measurement quality.
 Generator pressure prevents attributing an observed ceiling to the server.
 
-The assessment's **High-load benchmark qualification** table requires five valid repeats,
+The assessment's **High-load benchmark qualification** table requires five valid repeats of at least 30 seconds,
 >=99% completion of offered rate, scheduled p99 <=10 ms, and generator CPU below
 85% of its quota. It reports the highest *qualified tested level*, not an unbounded
 maximum. The 10 ms budget is a stated comparison criterion, not a universal SLO.
@@ -315,10 +316,9 @@ Before a full repeated comparison, distinguish reserved request slots from activ
 HTTP exchanges: the driver acquires a semaphore permit before spawning a task,
 while `peak_in_flight` counts only started tasks. Capacity drops with peak below
 128 therefore can reflect executor backlog, not 128 simultaneous network requests.
-The next diagnostic additions should record reserved/queued peaks, executor wait
-and submission burst sizes. Normalize pacing before interpreting rare capacity
-drops as a server limit. Do not loosen the qualification threshold simply to
-produce a winner.
+Reserved/queued peaks, executor wait and submission burst sizes are now recorded.
+Normalize pacing before interpreting rare capacity drops as a server limit. Do
+not loosen the qualification threshold simply to produce a winner.
 
 Then calibrate baseline on the same runner for >=20 seconds, sweep 128/512 slot
 bounds, and locate the Redis boundary with finer 10k/15k/20k/25k rates. Confirm
@@ -326,3 +326,146 @@ candidate levels with >=5 repetitions and phase-aligned resource samples. Memory
 and Redis need independent rate ladders; the same coarse levels need not bracket
 both boundaries. A clean committed source tree and matched environment are required
 for formal comparative conclusions.
+
+
+## Faster runs without weakening the assertions
+
+The optional fixed comparison uses backend-specific rate ladders: Memory 30k/60k and
+Redis 15k/20k/25k, preserving five repetitions per cell. These target the ranges
+observed in earlier probes. This is 110 cells rather than 135 (18.5% fewer cells
+at matched durations). With the current 30+5 second defaults it is 3850 seconds
+of load. Earlier 20+5 second runs were 2750 versus 3375 seconds. Startup/build time
+is additional; the workflow campaign uses a data-dependent confirmation subset.
+All-allow policy, quotas and resource limits remain identical across peers within
+each backend. Existing repeat, transport, SLO and accounting requirements remain.
+The shared comparison slot ceiling is now 512 rather than 128, allowing more
+short-lived overlap during scheduling stalls. It remains a hard bound, not 512
+permanently active connections. Results with different ceilings are separate
+workloads and must not be combined into a single performance ratio. Local
+baseline/HEAD short calibration completed without drops at this ceiling; sustained
+rates still require the unchanged five-repeat qualification on the target runner.
+Use `--rates` to override both ladders, or `--memory-rates` / `--redis-rates`
+to select them separately; the resolved plan and original CLI inputs are recorded.
+
+Docker stats now streams concurrently into a run-scoped temporary file, rather
+than blocking measurement completion in a no-stream polling loop. The sampler is
+terminated and reaped before container cleanup. Loadgen startup uses `--no-deps`
+only after server/Redis readiness has already been checked. Server/Redis stop grace
+is two seconds after requests, counters and diagnostics have completed. This
+reduces idle orchestration time, not measurement duration or warmup.
+
+### Historical version defect proof
+
+v0.1.2 is excluded from normal Safe/smoke/comparison matrices. Select manual
+workflow suite **defect**, or run:
+
+```sh
+python3 benchmarks/bench.py defect --resources ci --plan
+python3 benchmarks/bench.py defect --resources ci
+```
+
+The fixed proof uses one client, six sequential requests, a quota of five and a
+long window. It runs once on Memory (one-second load). It succeeds only when the
+known quota violation is actually reproduced without other invalidity. No repeated
+performance claims or heavy historical Redis run are required. v0.2.1 remains
+selectable explicitly but is also omitted from routine smoke. Existing historical
+archives remain untouched.
+
+### Driver queue visibility
+
+`peak_reserved_slots` includes queued and running tasks; `peak_queued_tasks` and
+`executor_wait` isolate pending tasks. `submission_lag` isolates pacing delay.
+`peak_dispatches_per_1ms_bin` reveals catch-up bursts, while `peak_in_flight`
+continues to describe started exchanges. The driver limits not-yet-started tasks
+to sixteen and yields to ready socket tasks during catch-up. Waiting preserves
+the original scheduled timestamp and the 100ms scheduler-loss check: delay is
+visible in submission/scheduled latency rather than hidden by rescheduling.
+These observations must not be confused
+with server-side admission timestamps or interpreted as a server saturation proof.
+
+The obsolete low-load behavior test was removed; protocol/framing, true five-second
+idle-close, error accounting, resource limits, compatibility and cleanup safety
+tests remain. Their duration is small relative to the benchmark matrix.
+
+### Contention versus isolated performance
+
+Concurrent peers are useful as an independent contention/resilience experiment.
+For attribution, prefer separate containers under a shared total budget, with
+per-peer quotas and metrics, over placing every product inside one container.
+A shared-container OOM/scheduler failure cannot reliably identify a single product
+or establish isolated implementation performance. Such an optional contention
+suite is not implemented here and must have a separate report and failure model.
+
+## Actions matrix and scoped workload winners
+
+The manual `compare` workflow now runs **Memory and Redis on two independent
+GitHub-hosted runners**, with `max-parallel: 2` and `fail-fast: false`. Each runner
+keeps baseline, HEAD and all backend-compatible competitors together. Products,
+rates and repetitions are never dispatched to different machines for a direct
+comparison. A backend failure retains its diagnostics and does not cancel its
+sibling. `smoke` remains one combined job; `defect` remains one Memory proof.
+
+Parallel backends can reduce elapsed time but do not promise a twofold speedup or
+lower billed runner minutes: cold builds, queueing and unequal work remain.
+Tool tests run once in the preparation job. Redis omits governor before building.
+Raw artifacts have unique names `benchmark-diagnostics-memory` and
+`benchmark-diagnostics-redis`; `benchmark-overview` indexes their separate reports.
+Missing artifacts or failed shards make the overview fail explicitly. No raw
+rounds or RPS distributions are pooled across runner/platform identifiers.
+See the [Actions matrix documentation](https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/run-job-variations).
+
+Each backend follows this bounded campaign **on the same runner throughout**:
+
+1. Probe all supported products with 2-second warmup, 5-second measurement and
+   one repeat. Memory uses 15k/30k/45k/60k; Redis uses 10k/15k/20k/25k/30k RPS.
+   These are high-load probes, not qualified performance outcomes. Invalid HTTP
+   baseline measurements stop the campaign; a clean overload level is retained
+   but cannot calibrate that offered rate.
+2. Select each product's highest passing probe level within the calibrated HTTP
+   baseline range, HEAD's candidate for every product, and the highest jointly
+   passing probe level when available. Other cells are not repeated. Candidates
+   and unresolved products are saved in `campaign-plan.json`.
+3. Confirm selected cells using 5-second warmup, **30-second measurement, five
+   repetitions**, alternating product order, identical slots/quotas/resources
+   and fresh per-round state. Every confirmation includes baseline and HEAD.
+   All builds complete before traffic; repeated phase builds use local Docker
+   caches and still enforce locked source builds.
+4. Keep probes and confirmations labeled in raw data. Only confirmations can
+   establish qualified levels or directional cost results. A passing top probe
+   does not establish an unbounded maximum; an unbracketed boundary stays unknown.
+
+```sh
+python3 benchmarks/campaign.py --backend memory --output benchmarks/results/memory --plan
+python3 benchmarks/campaign.py --backend memory --output benchmarks/results/memory
+python3 benchmarks/campaign.py --backend redis --output benchmarks/results/redis
+# Short orchestration check, never a qualified result:
+python3 benchmarks/campaign.py --backend memory --check --allow-dirty --output benchmarks/results/campaign-check
+```
+
+Native measurement pauses after warmup and after request completion while the
+controller reads server/Redis cgroup counters. `resource_phase=measurement`
+excludes warmup; `resource_capture_skew_seconds` records the remaining bracket
+overhead. CPU denominators use the native measured interval. This is a bracketed
+measurement, not perfectly simultaneous nanosecond sampling. Memory peak remains
+a container-lifetime peak; RSS and Redis memory remain snapshots.
+
+`verdicts.json` and **Workload verdicts** separate two questions:
+
+- **Sustained-load winner:** one product passes all five clean confirmations at
+  an offered rate where the peer fails load criteria in every repeat, with no
+  generator CPU pressure. Mixed pass/fail, invalid measurements and unmatched
+  settings yield `inconclusive`. This establishes a win at that tested workload,
+  not a universal algorithm-efficiency or absolute maximum-throughput claim.
+- **Latency/CPU winner at jointly qualified rates:** peer/HEAD repeat pairs use
+  approximate 95% t intervals on log ratios. Five independent block effects are
+  assumed approximately normal; with five observations this is limited evidence,
+  not a simultaneous significance guarantee across all comparisons. A directional
+  result needs the entire interval beyond the larger of 5% and the matching
+  baseline's A/A relative range. Missing calibration or unaligned CPU measurements
+  or CPU capture skew above 2% of the measurement interval yields `inconclusive`.
+  RSS snapshots are not ranked.
+
+All-allow comparisons require every HTTP response to be allowed: unexpected 429s
+fail the workload even for algorithms without an equivalent sliding-log oracle.
+Different policies still retain their own guarantees. Reports may legitimately
+show no winner; selecting a favorable rate or ignoring errors cannot create one.
