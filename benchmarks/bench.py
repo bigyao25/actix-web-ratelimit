@@ -18,6 +18,7 @@ import report
 import resources
 import summary as assessment
 import variants
+import workloads
 
 ROOT = Path(__file__).resolve().parents[1]
 HERE = ROOT / 'benchmarks'
@@ -73,6 +74,16 @@ def controlled_measurement(process, capture):
         raise RuntimeError('Incomplete native measurement handshake')
     return result,before,after,ended-started
 
+def verify_reuse(metadata, source, images):
+    """Accept only unchanged source and the exact already-built native images."""
+    keys=('git_sha','source_hashes','rust','build','http_keep_alive_seconds')
+    if any(metadata.get(key)!=source.get(key) for key in keys):
+        raise RuntimeError('Build reuse refused: source or build settings changed')
+    for name,value in images.items():
+        old=source.get('images',{}).get(name,{})
+        if not old.get('Id') or any(value.get(k)!=old.get(k) for k in ('Id','Architecture','Os')):
+            raise RuntimeError('Build reuse refused: image changed or missing: '+name)
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('profile', nargs='?', default='safe', choices=['safe','smoke','explore','compare','defect'])
@@ -81,7 +92,7 @@ def main():
     p.add_argument('--backends', nargs='+', choices=['memory','redis'], default=None)
     p.add_argument('--clients', nargs='+', type=int, default=None)
     p.add_argument('--concurrency', nargs='+', type=int, default=None)
-    p.add_argument('--modes', nargs='+', choices=['allow','deny','mixed'], default=None)
+    p.add_argument('--modes', nargs='+', choices=['allow','deny','mixed','reject'], default=None)
     p.add_argument('--rate', type=int, default=None)
     p.add_argument('--memory-rates', nargs='+', type=int, help='Backend-specific rates; --rates overrides both backends')
     p.add_argument('--redis-rates', nargs='+', type=int)
@@ -92,6 +103,7 @@ def main():
     p.add_argument('--repeats', type=int, default=None)
     p.add_argument('--allow-dirty', action='store_true')
     p.add_argument('--skip-build', action='store_true')
+    p.add_argument('--reuse-build-manifest',type=str,help='Reuse images only after verifying recorded source, build settings and image IDs')
     p.add_argument('--output', type=Path, default=HERE/'results'/time.strftime('%Y%m%d-%H%M%S'))
     a = p.parse_args()
     explore=a.profile=='explore'
@@ -143,7 +155,7 @@ def main():
     rates=list(dict.fromkeys(rates))
     if a.profile=='smoke':
         rates_by_backend={b:list(dict.fromkeys(min(r,500) for r in rs)) for b,rs in rates_by_backend.items()}
-    workloads=sorted({(rate,b) for b,rs in rates_by_backend.items() for rate in rs})
+    workload_axes=sorted({(rate,b) for b,rs in rates_by_backend.items() for rate in rs})
     if any(not 1<=rate<=max_rate for rate in rates):
         p.error(f'Every rate step must be 1..{max_rate} RPS')
     if compare and (a.duration>60 or a.warmup>15 or a.repeats>5):
@@ -155,12 +167,16 @@ def main():
     if any(c not in ((1,) if defect else (32,128,512)) for c in a.concurrency) or any(c not in (1,100,10000) for c in a.clients):
         p.error('Use concurrency 32/128/512 and clients 1/100/10000')
     if a.plan:
-        cells=sum(variants.supports(v,backend,mode) for v,(rate,backend),mode in itertools.product(a.variants,workloads,a.modes))
+        cells=sum(variants.supports(v,backend,mode) for v,(rate,backend),mode in itertools.product(a.variants,workload_axes,a.modes))
         rounds=cells*len(a.clients)*len(a.concurrency)*a.repeats
-        print(json.dumps(dict(rounds=rounds,rates=rates,rates_by_backend=rates_by_backend,clients=a.clients,concurrency=a.concurrency,modes=a.modes,repeats=a.repeats,measurement_seconds=a.duration,warmup_seconds=a.warmup,load_seconds=rounds*(a.duration+a.warmup),note='Build, startup, sampling and cleanup time are additional'),indent=2))
+        quotas=[dict(backend=b,rate=r,clients=c,mode=m,quota=5 if defect else workloads.quota(m,r,a.duration,a.warmup,c))
+                for (r,b),c,m in itertools.product(workload_axes,a.clients,a.modes)]
+        print(json.dumps(dict(rounds=rounds,rates=rates,rates_by_backend=rates_by_backend,clients=a.clients,concurrency=a.concurrency,modes=a.modes,repeats=a.repeats,measurement_seconds=a.duration,warmup_seconds=a.warmup,load_seconds=rounds*(a.duration+a.warmup),quotas=quotas,note='Build, startup, sampling and cleanup time are additional'),indent=2))
         return
     if a.profile not in ('smoke','defect') and a.skip_build:
         p.error('--skip-build is limited to smoke/defect; formal runs must rebuild from the recorded source')
+    if a.reuse_build_manifest and (not compare or a.skip_build):
+        p.error('Verified build reuse is exclusive to compare and cannot be combined with --skip-build')
     dirty = run('git','status','--porcelain',cwd=ROOT)
     if dirty and not a.allow_dirty:
         p.error('Dirty tree: commit changes or explicitly use --allow-dirty (results marked non-reproducible)')
@@ -218,16 +234,20 @@ def main():
         if not lockfile.exists():
             p.error('Missing checked-in lockfile: '+str(lockfile))
         (a.output/(v+'.Cargo.lock')).write_bytes(lockfile.read_bytes())
-        if not a.skip_build:
+        if not a.skip_build and not a.reuse_build_manifest:
             subprocess.run(['docker','build','-f',str(HERE/'docker/server.Dockerfile'),'--build-arg','VARIANT='+v,'-t','ratelimit-bench-'+v+':local',str(ROOT)],check=True)
     if compare:
         (a.output/'loadgen.Cargo.lock').write_bytes((HERE/'native-loadgen/Cargo.lock').read_bytes())
     generator_image='ratelimit-bench-loadgen-native:local' if compare else 'ratelimit-bench-loadgen:local'
     generator_dockerfile='native-loadgen.Dockerfile' if compare else 'loadgen.Dockerfile'
-    if not a.skip_build:
+    if not a.skip_build and not a.reuse_build_manifest:
         subprocess.run(['docker','build','-f',str(HERE/'docker'/generator_dockerfile),'-t',generator_image,str(ROOT)],check=True)
     images={v:json.loads(docker('image','inspect','ratelimit-bench-'+v+':local'))[0] for v in a.variants}
     images['loadgen']=json.loads(docker('image','inspect',generator_image))[0]
+    if a.reuse_build_manifest:
+        source_path=Path(a.reuse_build_manifest)
+        verify_reuse(metadata,json.loads(source_path.read_text()),images)
+        metadata['build_reuse']=dict(manifest=str(source_path),sha256=hashlib.sha256(source_path.read_bytes()).hexdigest())
     native={'aarch64':'arm64','x86_64':'amd64'}.get(info['Architecture'],info['Architecture'])
     if any(i['Architecture']!=native for i in images.values()):
         raise RuntimeError('Non-native image architecture; emulation is not permitted')
@@ -246,17 +266,21 @@ def main():
         env[key.upper()]=str(resource[key])
     compose=['docker','compose','-p',project,'-f',str(HERE/'compose.yaml')]
     def dc(*args): return run(*compose,*args,env=env)
+    project_live=False
     def cleanup():
+        nonlocal project_live
+        if not project_live: return
         result=subprocess.run(compose+['down','--volumes','--remove-orphans'],env=env,check=False,stdout=subprocess.DEVNULL)
         remaining=docker('ps','-aq','--filter','label=com.docker.compose.project='+project)
         if result.returncode or remaining:
             raise RuntimeError('Benchmark cleanup failed for '+project+'; inspect only this project before continuing')
+        project_live=False
     def interrupted(*_): raise KeyboardInterrupt()
     signal.signal(signal.SIGTERM,interrupted)
     rounds=[]
     platform_id=hashlib.sha256(json.dumps([platform.node(),info['ID'],info['Architecture'],info['NCPU'],info['MemTotal']]).encode()).hexdigest()[:16]
     try:
-        for (rate,backend),clients,concurrency,mode in itertools.product(workloads,a.clients,a.concurrency,a.modes):
+        for (rate,backend),clients,concurrency,mode in itertools.product(workload_axes,a.clients,a.concurrency,a.modes):
             a.rate=rate
             # Forward/reverse blocks plus independent baseline repeats provide A/A calibration.
             for repeat in range(a.repeats):
@@ -265,11 +289,12 @@ def main():
                     if not variants.supports(v,backend,mode):
                         continue
                     duration=a.duration
-                    limit=0 if mode=='deny' else (a.rate*(duration+a.warmup)+100 if mode=='allow' else max(1,int(a.rate*duration/clients/2)))
+                    limit=workloads.quota(mode,a.rate,duration,a.warmup,clients)
                     if defect: limit=5
                     env.update(SERVER_IMAGE='ratelimit-bench-'+v+':local',BACKEND=backend,LIMIT=str(limit),WINDOW=str(duration+a.warmup+60),RATE=str(a.rate),DURATION=str(duration),WARMUP=str(a.warmup),CLIENTS=str(clients),CONCURRENCY=str(concurrency))
                     print(f'rate={rate} {v} {backend} clients={clients} concurrency={concurrency} mode={mode} repeat={repeat}',flush=True)
                     try:
+                        project_live=True
                         dc('up','-d','--wait','server')
                         ids={s:dc('ps','-q',s) for s in ('server','redis')}
                         inspections={s:json.loads(docker('inspect',cid))[0] for s,cid in ids.items()}
@@ -325,6 +350,7 @@ def main():
                                       resource_capture_skew_seconds=max(0,diagnostic_seconds-result['elapsed_seconds']) if compare else None,
                                       resource_profile=a.resources, server_cpu_limit=resource['server_cpus'],
                                       platform_id=platform_id,variant=v,scenario=f'{backend}/{clients}/{concurrency}/{mode}/{rate}rps',repeat=repeat,
+                                      workload_clients=clients,workload_mode=mode,rejection_fraction=workloads.rejection_fraction(result),
                                       oom=any(x['State']['OOMKilled'] for x in states.values()) or any(counters(raw).get('oom',0)>0 for raw in after.values()) or counters(result['loadgen_cgroup']['memory.events']).get('oom',0)>0,redis_oom=int(rc.get('errorstat_OOM','count=0').split('=')[-1])>0,
                                       cpu_throttled=throttled and not compare, quota_throttled=throttled,
                                       loadgen_peak_bytes=int(result['loadgen_cgroup']['memory.peak']),

@@ -4,6 +4,7 @@ import argparse
 import json
 import math
 import statistics
+import workloads
 from pathlib import Path
 
 
@@ -68,7 +69,7 @@ def load_failures(row):
     reasons=[]
     if row.get('dropped_capacity',0)>0: reasons.append('in-flight limit reached')
     if row.get('workload') in ('comparison','pk'):
-        if '/allow/' in row.get('scenario','') and row.get('http_429',0)>0: reasons.append('unexpected rejection in all-allow workload')
+        reasons += workloads.coverage_failures(row)
         if row.get('http_rps',row.get('achieved_rps',0))<.99*row.get('target_rps',1): reasons.append('HTTP completion below 99%')
         if (row.get('scheduled_latency',{}).get('p99_ms') or float('inf'))>10: reasons.append('scheduled p99 above 10ms')
         if row.get('loadgen_cpu_pct',float('inf'))>=85*row.get('loadgen_cpu_limit',1): reasons.append('loadgen CPU pressure')
@@ -152,7 +153,7 @@ def markdown(result):
     for r in result['rounds']:
         for status, values in r.get('status_latency',{}).items():
             lines.append('| '+esc(str(r.get('variant'))+' / '+str(r.get('scenario')))+' | '+status+' | '+' | '.join(fmt(values.get(k)) for k in ('p50_ms','p95_ms','p99_ms'))+' |')
-    lines += ['', '## Measurement quality versus load outcome', '',
+    lines += ['', workloads.markdown(result['rounds']), '## Measurement quality versus load outcome', '',
               '| Variant / scenario | Measurement | Load outcome | HTTP RPS | Transport categories | Capacity / scheduler drops |',
               '| --- | --- | --- | ---: | --- | ---: |']
     for r in result['rounds']:

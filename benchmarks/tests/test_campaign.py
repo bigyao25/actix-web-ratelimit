@@ -28,9 +28,10 @@ def row(variant, rate=10000, repeat=0, **changes):
 
 
 class CampaignTest(unittest.TestCase):
-    def test_confirmation_keeps_baseline_head_and_peer_boundary(self):
+    def test_confirmation_keeps_baseline_head_and_adjacent_bounds(self):
         rows=[row(v,rate) for v in ('baseline','head','extensible') for rate in (10000,20000)]
         rows[-1]['http_rps']=10000
+        rows[3]['http_rps']=10000
         plan,details=campaign.confirmation_plan(rows,'memory',['baseline','head','extensible'])
         self.assertEqual(plan,[{'rate':10000,'variants':['baseline','head','extensible']},
                                {'rate':20000,'variants':['baseline','head','extensible']}])
