@@ -10,5 +10,5 @@ baseline = []
 legacy = []
 modern = []
 [dependencies]
-actix-web = { version = "=4.11.0", default-features = false, features = ["macros"] }
+actix-web = { version = "=4.18.1", default-features = false, features = ["macros"] }
 limiter = { package = "actix-web-ratelimit", path = "../../.." }

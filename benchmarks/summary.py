@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import report
+import comparison
 
 
 def expected_historical(round_):
@@ -23,6 +24,8 @@ def assess(round_):
     generator_pressure=round_.get('loadgen_cpu_pct',0)>=85*round_.get('loadgen_cpu_limit',1)
     if generator_pressure and (round_.get('loadgen_saturated') or round_.get('dispatch_lag',{}).get('p99_ms',0)>10):
         return 'loadgen pressure; server capacity unresolved'
+    if reasons and round_.get('dropped_capacity',0)>0 and not generator_pressure:
+        return 'in-flight cap reached; inspect SUT/transport; rate not sustained'
     if reasons:
         return 'invalid; capacity unresolved'
     if round_.get('scheduled_latency',{}).get('p99_ms',0)>10:
@@ -72,9 +75,10 @@ def render(folder, status='unknown', artifact_url=''):
             lines += ['', 'Table truncated; the artifact contains every round.']
         levels=collections.defaultdict(list)
         for r in valid:
-            if r.get('variant')!='governor':
+            if r.get('variant') not in ('governor','trypema','extensible') and r.get('workload')!='behavior':
                 levels[(r.get('variant'),r.get('scenario','').split('/')[0])].append(r.get('target_rps',0))
-        lines += ['','## Highest valid offered rates','']
+        if levels:
+            lines += ['','## Highest valid offered rates','']
         for (variant,backend),rates in sorted(levels.items()):
             lines += [f'- {esc(variant)} / {esc(backend)}: {max(rates):g} RPS validated in at least one cell; **not a capacity estimate**.']
         lines += ['', '## Exclusions and next step','']
@@ -88,6 +92,36 @@ def render(folder, status='unknown', artifact_url=''):
         else:
             lines += ['- If no pressure was demonstrated, use a bounded local `explore` sweep; a higher rate alone does not prove saturation.']
         lines += ['- Confirm any candidate boundary with longer repeated runs, identical quotas/resources and latency/error criteria. Short-run p99 values remain descriptive.']
+    if env.get('profile',{}).get('profile')=='pk':
+        groups=collections.defaultdict(list)
+        for r in rows:
+            groups[(r.get('variant'),r.get('scenario'))].append(r)
+        qualified=collections.defaultdict(list)
+        lines += ['', '## High-load PK qualification','',
+                  'Same offered rates, workers, quotas and resource layout. A level qualifies only with at least five valid repeats, completion >=99% of offered load, scheduled p99 <=10ms, and loadgen CPU below 85% of its quota. Higher offered rate alone is not proof of server pressure.',
+                  'SUT cgroup throttling is expected enforcement of the fixed CPU budget in PK and is recorded, not treated as environmental corruption. OOM, transport errors and dropped arrivals remain invalid.','',
+                  '| Variant / scenario | Repeats | Qualified at this rate | Reason |', '| --- | ---: | --- | --- |']
+        for (variant,scenario),items in sorted(groups.items()):
+            checks=[(len(items)>=5,'fewer than five repeats'),
+                    (all(not r['invalid_reasons'] for r in items),'invalid round'),
+                    (all(r.get('achieved_rps',0)>=.99*r.get('target_rps',1) for r in items),'completion below 99%'),
+                    (all((r.get('scheduled_latency',{}).get('p99_ms') or float('inf'))<=10 for r in items),'scheduled p99 above 10ms'),
+                    (all(r.get('loadgen_cpu_pct',float('inf'))<85*r.get('loadgen_cpu_limit',1) for r in items),'loadgen CPU pressure')]
+            passed=all(ok for ok,_ in checks)
+            if passed: qualified[(variant,scenario.split('/')[0],'/'.join(scenario.split('/')[1:-1]))].append(items[0]['target_rps'])
+            lines.append('| '+esc(str(variant)+' / '+str(scenario))+' | '+str(len(items))+' | '+str(passed)+' | '+esc('; '.join(reason for ok,reason in checks if not ok) or 'all criteria met')+' |')
+        lines += ['', 'Highest qualified tested level (not an unbounded maximum):','']
+        for (variant,backend,condition),rates in sorted(qualified.items(),key=lambda item:(item[0][1],item[0][2],-max(item[1]))):
+            lines.append('- '+esc(str(variant)+' / '+backend+' / '+condition)+': '+str(max(rates))+' RPS; policy guarantees remain different.')
+    contrasts=comparison.contrasts(valid)
+    if contrasts:
+        lines += ['', '## Competitor cost at matched workloads','',
+                  'Ratios are competitor / HEAD medians at identical recorded quotas/resources. Different algorithms provide different guarantees: these observations do not rank implementation efficiency. CPU spans warmup; RSS and Redis memory are snapshots, not normalized state-size estimates.',
+                  'At least five repeats and non-overlapping observed p99 ranges are needed for the descriptive separation label; this is not a confidence interval or significance test.','',
+                  '| Competitor / scenario | Algorithm | Matched repeats | p99 ratio | Server CPU ratio | RSS ratio | Redis memory ratio | Evidence |',
+                  '| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |']
+        for c in contrasts:
+            lines.append('| '+esc(c['variant']+' / '+c['scenario'])+' | '+esc(c['algorithm'])+' | '+str(c['repeats'])+' | '+' | '.join(fmt(c[key]) for key in ('p99_ratio','cpu_ratio','rss_ratio','redis_ratio'))+' | '+esc(c['evidence'])+' |')
     lines += ['', '## Files','', '`report.md`: full tables; `raw.json`: all rounds; `validated.json`: exclusions/statistics; `environment.json`: platform/limits/images; `run.log`: build and execution log.']
     if artifact_url:
         lines += ['', f'[Download benchmark diagnostics artifact]({artifact_url})']

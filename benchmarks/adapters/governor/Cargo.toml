@@ -5,5 +5,5 @@ edition = "2024"
 publish = false
 [workspace]
 [dependencies]
-actix-web = { version = "=4.11.0", default-features = false, features = ["macros"] }
+actix-web = { version = "=4.18.1", default-features = false, features = ["macros"] }
 actix-governor = "=0.10.0"

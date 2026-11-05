@@ -45,7 +45,7 @@ Other running containers are recorded and warned about, not stopped.
 
 ## Workload and correctness
 
-Adapters share the same Actix 4.11.0 HTTP handler, header identity, worker count and
+Adapters share the same Actix 4.18.1 HTTP handler, header identity, worker count and
 request body. Historical Cargo dependencies use exact published versions, with
 independent checked-in locks. HEAD uses the local path. Registry checksums in locks
 identify release source archives; HEAD SHA and dirty status identify local source.
@@ -100,8 +100,7 @@ New algorithms need separate semantics and correctness oracles.
 
 CI only runs short smoke/build verification, never the full matrix or a regression
 gate. Current limitations: no full rolling-window oracle, no remotely induced Redis
-fault suite, no host thermal telemetry, no confidence intervals, and no trypema
-adapter yet. BuildKit resource usage is not capped by Compose runtime limits.
+fault suite, no host thermal telemetry, no confidence intervals, and no multi-worker race oracle for bucketed competitor admission. BuildKit resource usage is not capped by Compose runtime limits.
 
 ## Timing and load diagnostics (schema 2)
 
@@ -173,7 +172,7 @@ SLO. Generator saturation invalidates server capacity comparisons. Confirm any
 candidate boundary using longer repeated runs. The Python generator may hit its
 own CPU limit first; increasing offered rate cannot resolve that ambiguity.
 
-Pull requests and manual workflow dispatch run **only short smoke**, not explore.
+The benchmark workflow runs **only by manual dispatch**, selecting **pk or smoke**, never explore. Pushes and pull requests do not trigger it.
 CI explicitly uses server=1 CPU, loadgen=0.5 CPU, Redis=0.5 CPU, one HTTP worker;
 memory/swap limits are unchanged. On 2-CPU runners the generator and Redis share
 CPU 0, and the server uses CPU 1. On >=3-CPU runners sets are disjoint. This sharing
@@ -204,3 +203,58 @@ python3 benchmarks/summary.py benchmarks/results/<run> --status completed --outp
 
 Runner architecture, quotas and platform identifiers must match before comparing
 runs; local Apple Silicon results cannot rank against shared x64 Runner numbers.
+
+
+## High-load competitor PK (manual only)
+
+Select **Actions → Benchmark PK → Run workflow → suite: pk**. This is the default
+manual suite. Pushes and pull requests never trigger this workflow. The obsolete
+low-load behavior suite has been removed. Optional `smoke` is only an operational
+check, not the competitor comparison result.
+
+PK compares baseline, HEAD, governor, trypema and extensible sequentially using the
+same Actix 4.18.1 stack and request workload. Defaults: 10k/30k/60k offered RPS,
+128 concurrency ceiling, one client, all-allow, 5 s warmup + 20 s measurement,
+five repetitions in alternating order, Memory and Redis. Unsupported backend cells
+are skipped by the published capability registry. Plan: 135 cells, 3375 seconds
+of load, plus compilation/startup/cleanup; the manual job timeout is 120 minutes.
+
+PK requires **four native Docker CPUs**: native Rust loadgen=2 CPUs (sets 0,1),
+server=1 CPU (set 2, one worker), Redis=1 CPU (set 3). Memory/swap limits remain
+512 MiB/1 GiB/512 MiB. It refuses smaller/shared layouts, including CI smoke's
+0.5-CPU generator. Docker Desktop global configuration is unchanged. Existing Safe
+resources and rate bounds remain unchanged. The explicit PK hard ceilings are
+100k RPS, 512 concurrency, 60 s measurement, 15 s warmup, five repeats.
+
+```sh
+python3 benchmarks/bench.py pk --plan
+python3 benchmarks/bench.py pk
+# A narrower, repeated Memory comparison:
+python3 benchmarks/bench.py pk --backends memory --variants baseline head governor trypema extensible --rates 10000 30000 60000 --plan
+```
+
+The Rust/Tokio generator uses pooled HTTP/1.1 connections, bounded in-flight tasks,
+fixed-size latency histograms, and explicit dropped-arrival/error accounting. Its
+locked dependencies are copied into the run artifacts. Histograms round upward:
+0.01 ms bins through 100 ms, 0.1 ms through 1 s, then 1 ms. The Python generator
+remains for smoke/Safe/explore compatibility; it is not used by PK. Native image
+architecture is verified along with server images. No x86 emulation is requested.
+
+Fixed resource throttling is normal when pushing a capped server: PK records
+`quota_throttled` and raw cgroup counters without invalidating a round solely for
+SUT quota throttling. OOM, Redis OOM, malformed responses, dropped arrivals,
+transport failures and asserted quota violations still invalidate comparisons.
+Generator pressure prevents attributing an observed ceiling to the server.
+
+The assessment's **High-load PK qualification** table requires five valid repeats,
+>=99% completion of offered rate, scheduled p99 <=10 ms, and generator CPU below
+85% of its quota. It reports the highest *qualified tested level*, not an unbounded
+maximum. The 10 ms budget is a stated comparison criterion, not a universal SLO.
+If every level qualifies without server pressure, raise rates within the explicit
+ceiling rather than calling the last number maximum throughput.
+
+Cost tables include competitor/HEAD medians at matched quotas/resources. Policy
+labels and nominal over-admission remain visible. Different policies may be
+compared as end-to-end products but do not become equivalent algorithms. A winner
+is not manufactured from differing accepted-request counts or generator overload.
+Old Actix 4.11 results must be rebaselined after the common HTTP stack update.

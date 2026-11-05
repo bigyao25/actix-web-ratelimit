@@ -69,7 +69,7 @@ def summarize(data):
     for row in rows:
         same = [r for r in rows if r['platform_id']==row['platform_id'] and r['scenario']==row['scenario'] and all(r[k]==row[k] for k in ('target_rps','measurement_seconds','warmup_seconds'))]
         for variant, label in [('baseline','baseline'),('v0.2.1','reference')]:
-            ref = next((r for r in same if r['variant']==variant), None) if row['variant']!='governor' else None
+            ref = next((r for r in same if r['variant']==variant), None) if row['variant'] not in ('governor','trypema','extensible') and '/behavior/' not in row['scenario'] else None
             row[label+'_rps_change_pct'] = (100*(row['median_rps']/ref['median_rps']-1) if ref and ref['median_rps'] else None)
             row[label+'_p99_overhead_ms'] = row['median_p99_ms']-ref['median_p99_ms'] if ref else None
         row['aa_spread_pct'] = 100*(row['max_rps']-row['min_rps'])/row['median_rps'] if row['median_rps'] and row['rounds']>1 else None

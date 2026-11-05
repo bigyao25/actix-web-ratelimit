@@ -28,7 +28,7 @@ services:
       redis:
         condition: service_healthy
   loadgen:
-    image: ratelimit-bench-loadgen:local
+    image: ${LOADGEN_IMAGE:-ratelimit-bench-loadgen:local}
     cpus: ${LOADGEN_CPUS:-1}
     cpuset: ${LOADGEN_CPUSET:-0}
     mem_limit: 512m

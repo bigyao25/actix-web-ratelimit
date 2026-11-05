@@ -1,8 +1,13 @@
-name: Benchmark smoke
+name: Benchmark PK
 on:
-  pull_request:
-    paths: ['benchmarks/**', 'src/**', 'Cargo.toml', 'Cargo.lock', '.github/workflows/benchmark.yml']
   workflow_dispatch:
+    inputs:
+      suite:
+        description: 'High-load competitor PK (4 CPUs) or short operational smoke'
+        required: true
+        default: pk
+        type: choice
+        options: [pk, smoke]
 permissions:
   contents: read
 concurrency:
@@ -11,7 +16,7 @@ concurrency:
 jobs:
   smoke:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7
         with:
@@ -19,12 +24,21 @@ jobs:
           fetch-depth: 0
       - name: Test benchmark tooling
         run: python3 -m unittest discover -s benchmarks/tests -v
-      - name: Build and run bounded CI smoke
+      - name: Build and run bounded comparison
         id: benchmark
+        env:
+          BENCHMARK_SUITE: ${{ inputs.suite }}
         run: |
           mkdir -p benchmarks/results/ci
           set -o pipefail
-          python3 benchmarks/bench.py smoke --resources ci --variants baseline head v0.1.2 v0.2.1 governor --backends memory redis --output benchmarks/results/ci 2>&1 | tee benchmarks/results/ci/run.log
+          if [ "$BENCHMARK_SUITE" = pk ]; then
+            resource=pk
+            variants=(baseline head governor trypema extensible)
+          else
+            resource=ci
+            variants=(baseline head v0.1.2 v0.2.1 governor trypema extensible)
+          fi
+          python3 benchmarks/bench.py "$BENCHMARK_SUITE" --resources "$resource" --variants "${variants[@]}" --backends memory redis --output benchmarks/results/ci 2>&1 | tee benchmarks/results/ci/run.log
       - name: Generate assessment even on failure
         if: always()
         env:

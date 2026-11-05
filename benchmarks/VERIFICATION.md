@@ -61,3 +61,42 @@ without invalid rounds; at 10000 target RPS, completions were about 9989 RPS.
 These 2-second probes did not demonstrate a capacity boundary. No maximum-RPS
 claim follows. Job-summary generation was exercised with a local
 GITHUB_STEP_SUMMARY file; GitHub-hosted workflow execution/upload has not been run.
+
+
+## Competitor expansion (not yet container-verified)
+
+Added actix-trypema =0.1.2/core =2.2.1 and actix-extensible-rate-limit =0.4.0
+Memory/Redis adapters. All seven adapters now pin Actix =4.18.1. All seven passed
+locked offline cargo check; the new adapters also passed direct dependency/API
+checks. Extensible emits a future-incompatibility warning; source is unmodified.
+Tool regression tests cover capability filtering, trace scheduling, matched-cost
+groups and evidence labels. Behavior fixtures in unit tests are synthetic and
+are not measured competitor outcomes.
+
+The requested Docker build/run was rejected at authorization, so no new container
+benchmark ran and no newly measured competitor differences are claimed. Existing
+4.11.0 results remain historical and must not be compared as limiter improvements
+to this updated common HTTP stack. Workflow dispatch now offers the bounded
+behavior suite; manually dispatched CI smoke adds both new competitors. The
+benchmark workflow has no automatic push or pull-request trigger.
+
+
+## High-load PK revision
+
+Low-load behavior entry points were removed. Manual Workflow defaults to `pk`,
+using a native Rust/Tokio pooled HTTP/1.1 generator with bounded tasks/histograms.
+Default rates are 10k/30k/60k, five repeats; resources are disjoint 2/1/1 CPUs for
+loadgen/server/Redis. Safe/smoke resource defaults remain available separately.
+Native protocol/histogram/zero-warmup tests pass (3); Python tool tests pass (32).
+
+A native 10k RPS end-to-end check completed 9 cells (3-second measurements, one
+repeat): 8 valid; extensible Memory dropped 111 scheduled arrivals at the in-flight
+cap and was excluded. Its loadgen CPU did not establish generator CPU saturation;
+no causal server bottleneck or performance winner is claimed. Every other cell
+completed the planned 30,000 requests. This is a high-arrival-rate integration
+check, not the full repeated PK qualification. Full defaults remain manual-only.
+
+In PK, intentional SUT CPU-quota throttling is retained as a pressure signal, not
+solely an invalidity reason. Request loss, protocol/transport errors, OOM and
+asserted quota errors still invalidate. Qualification is scoped to matching
+backend/client/concurrency/mode and tested rates; generator pressure blocks it.

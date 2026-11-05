@@ -1,0 +1,11 @@
+[package]
+name = "bench-server"
+version = "0.0.0"
+edition = "2024"
+publish = false
+[workspace]
+[dependencies]
+actix-web = { version = "=4.18.1", default-features = false, features = ["macros"] }
+actix-trypema = { version = "=0.1.2", features = ["redis"] }
+trypema = "=2.2.1"
+redis = { version = "=1.8.1", default-features = false, features = ["tokio-comp", "connection-manager"] }

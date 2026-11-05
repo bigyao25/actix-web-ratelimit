@@ -15,10 +15,11 @@ import uuid
 import report
 import resources
 import summary as assessment
+import variants
 
 ROOT = Path(__file__).resolve().parents[1]
 HERE = ROOT / 'benchmarks'
-VARIANTS = ('baseline','v0.1.2','v0.2.1','head','governor')
+VARIANTS = tuple(variants.VARIANTS)
 
 def run(*args, **kwargs):
     return subprocess.check_output(args, text=True, **kwargs).strip()
@@ -35,15 +36,15 @@ def counters(raw):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('profile', nargs='?', default='safe', choices=['safe','smoke','explore'])
-    p.add_argument('--resources', choices=['safe','ci'], default='safe')
+    p.add_argument('profile', nargs='?', default='safe', choices=['safe','smoke','explore','pk'])
+    p.add_argument('--resources', choices=['safe','ci','pk'], default=None)
     p.add_argument('--variants', nargs='+', choices=VARIANTS, default=None)
     p.add_argument('--backends', nargs='+', choices=['memory','redis'], default=['memory','redis'])
     p.add_argument('--clients', nargs='+', type=int, default=None)
     p.add_argument('--concurrency', nargs='+', type=int, default=None)
     p.add_argument('--modes', nargs='+', choices=['allow','deny','mixed'], default=None)
     p.add_argument('--rate', type=int, default=None)
-    p.add_argument('--rates', nargs='+', type=int, help='Sequential rates: safe <=2000, local explore <=10000')
+    p.add_argument('--rates', nargs='+', type=int, help='Sequential rates: safe <=2000, explore <=10000, PK <=100000')
     p.add_argument('--plan', action='store_true', help='Print matrix size and load duration without Docker or builds')
     p.add_argument('--duration', type=int, default=None)
     p.add_argument('--warmup', type=int, default=None)
@@ -53,7 +54,21 @@ def main():
     p.add_argument('--output', type=Path, default=HERE/'results'/time.strftime('%Y%m%d-%H%M%S'))
     a = p.parse_args()
     explore=a.profile=='explore'
-    a.variants=a.variants or (['baseline','head'] if explore else list(VARIANTS[:-1]))
+    pk=a.profile=='pk'
+    a.resources=a.resources or ('pk' if pk else 'safe')
+    if pk:
+        a.variants=a.variants or ['baseline','head','governor','trypema','extensible']
+        a.clients=a.clients or [1]
+        a.concurrency=a.concurrency or [128]
+        a.modes=a.modes or ['allow']
+        a.duration=a.duration if a.duration is not None else 20
+        a.warmup=a.warmup if a.warmup is not None else 5
+        a.repeats=a.repeats if a.repeats is not None else 5
+        if a.rates is None and a.rate is None:
+            a.rates=[10000,30000,60000]
+    if pk != (a.resources=='pk'):
+        p.error('PK runs require --resources pk; this layout is exclusive to PK')
+    a.variants=a.variants or (['baseline','head'] if explore else ['baseline','v0.1.2','v0.2.1','head'])
     a.clients=a.clients or ([1] if explore else [1,100,10000])
     a.concurrency=a.concurrency or ([128] if explore else [32,128,512])
     a.modes=a.modes or (['allow'] if explore else ['allow','deny','mixed'])
@@ -71,10 +86,12 @@ def main():
     rates=a.rates or [a.rate]
     if a.profile=='smoke':
         rates=[min(rate,500) for rate in rates]
-    max_rate=10000 if explore else 2000
+    max_rate=100000 if pk else 10000 if explore else 2000
     rates=list(dict.fromkeys(rates))
     if any(not 1<=rate<=max_rate for rate in rates):
         p.error(f'Every rate step must be 1..{max_rate} RPS')
+    if pk and (a.duration>60 or a.warmup>15 or a.repeats>5):
+        p.error('PK bounds: duration <=60, warmup <=15, repeats <=5')
     if explore and (a.duration>30 or a.warmup>10 or a.repeats>3):
         p.error('Explore bounds: duration <=30, warmup <=10, repeats <=3')
     if not (1<=a.rate<=max_rate and 1<=a.duration<=120 and 0<=a.warmup<=30 and 1<=a.repeats<=10):
@@ -82,7 +99,7 @@ def main():
     if any(c not in (32,128,512) for c in a.concurrency) or any(c not in (1,100,10000) for c in a.clients):
         p.error('Use concurrency 32/128/512 and clients 1/100/10000')
     if a.plan:
-        cells=sum(not (v=='governor' and (backend=='redis' or mode=='deny')) for v,backend,mode in itertools.product(a.variants,a.backends,a.modes))
+        cells=sum(variants.supports(v,backend,mode) for v,backend,mode in itertools.product(a.variants,a.backends,a.modes))
         rounds=cells*len(a.clients)*len(a.concurrency)*len(rates)*a.repeats
         print(json.dumps(dict(rounds=rounds,rates=rates,load_seconds=rounds*(a.duration+a.warmup),note='Build, startup, sampling and cleanup time are additional'),indent=2))
         return
@@ -112,8 +129,8 @@ def main():
     sets=[cpus(os.environ.get(k,resource[v])) for k,v in [('LOADGEN_CPUSET','loadgen_cpuset'),('SERVER_CPUSET','server_cpuset'),('REDIS_CPUSET','redis_cpuset')]]
     if any(not x or min(x)<0 or max(x)>=info['NCPU'] for x in sets):
         p.error('Invalid CPU set')
-    if a.resources=='safe' and ([len(x) for x in sets]!=[1,2,1] or any(x&y for x,y in itertools.combinations(sets,2))):
-        p.error('Safe CPU sets require disjoint 1/2/1 CPUs')
+    if a.resources in ('safe','pk') and ([len(x) for x in sets]!=([2,1,1] if pk else [1,2,1]) or any(x&y for x,y in itertools.combinations(sets,2))):
+        p.error('CPU sets require disjoint 2/1/1 CPUs for PK or 1/2/1 for Safe')
     for key, selected in zip(('loadgen_cpuset','server_cpuset','redis_cpuset'),sets):
         resource[key]=','.join(map(str,sorted(selected)))
     resource['effective_cpusets']=[sorted(x) for x in sets]
@@ -128,7 +145,7 @@ def main():
         print('Warning: other running containers may interfere; recorded in environment.json',flush=True)
     metadata=dict(git_sha=run('git','rev-parse','HEAD',cwd=ROOT),dirty=dirty,
                   platform=platform.platform(),docker=info,profile=vars(a)|{'output':str(a.output)},
-                  resource_layout=resource, other_running_containers=outsiders, rust='1.98.0', build='release --locked',competitors='governor 0.10.0 GCRA optional; trypema 0.1.2 excluded; see competitors.md')
+                  resource_layout=resource, other_running_containers=outsiders, rust='1.98.0', build='release --locked',competitors='governor 0.10.0; trypema 0.1.2/core 2.2.1; extensible 0.4.0; Actix 4.18.1')
     metadata['release_tag_commits']={v:run('git','rev-parse',v+'^{commit}',cwd=ROOT) for v in a.variants if v.startswith('v') and subprocess.run(['git','rev-parse','--verify',v+'^{commit}'],cwd=ROOT,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode==0}
     metadata['source_hashes']={name:hashlib.sha256((ROOT/name).read_bytes()).hexdigest() for name in run('git','ls-files','--cached','--others','--exclude-standard',cwd=ROOT).splitlines() if (ROOT/name).is_file()}
     (a.output/'environment.json').write_text(json.dumps(metadata,indent=2))
@@ -141,9 +158,14 @@ def main():
         (a.output/(v+'.Cargo.lock')).write_bytes(lockfile.read_bytes())
         if not a.skip_build:
             subprocess.run(['docker','build','-f',str(HERE/'docker/server.Dockerfile'),'--build-arg','VARIANT='+v,'-t','ratelimit-bench-'+v+':local',str(ROOT)],check=True)
+    if pk:
+        (a.output/'loadgen.Cargo.lock').write_bytes((HERE/'native-loadgen/Cargo.lock').read_bytes())
+    generator_image='ratelimit-bench-loadgen-native:local' if pk else 'ratelimit-bench-loadgen:local'
+    generator_dockerfile='native-loadgen.Dockerfile' if pk else 'loadgen.Dockerfile'
     if not a.skip_build:
-        subprocess.run(['docker','build','-f',str(HERE/'docker/loadgen.Dockerfile'),'-t','ratelimit-bench-loadgen:local',str(ROOT)],check=True)
+        subprocess.run(['docker','build','-f',str(HERE/'docker'/generator_dockerfile),'-t',generator_image,str(ROOT)],check=True)
     images={v:json.loads(docker('image','inspect','ratelimit-bench-'+v+':local'))[0] for v in a.variants}
+    images['loadgen']=json.loads(docker('image','inspect',generator_image))[0]
     native={'aarch64':'arm64','x86_64':'amd64'}.get(info['Architecture'],info['Architecture'])
     if any(i['Architecture']!=native for i in images.values()):
         raise RuntimeError('Non-native image architecture; emulation is not permitted')
@@ -153,6 +175,7 @@ def main():
     metadata['compose_project']=project
     (a.output/'environment.json').write_text(json.dumps(metadata,indent=2))
     env=os.environ.copy()
+    env['LOADGEN_IMAGE']=generator_image
     for key in ('server_cpus','loadgen_cpus','redis_cpus','workers','server_cpuset','loadgen_cpuset','redis_cpuset'):
         env.setdefault(key.upper(),str(resource[key]))
     # CPU quotas are authoritative for the selected layout.
@@ -176,7 +199,7 @@ def main():
             for repeat in range(a.repeats):
                 order=list(a.variants) if repeat%2==0 else list(reversed(a.variants))
                 for v in order:
-                    if v=='governor' and (backend=='redis' or mode=='deny'):
+                    if not variants.supports(v,backend,mode):
                         continue
                     duration=a.duration
                     limit=0 if mode=='deny' else (a.rate*(duration+a.warmup)+100 if mode=='allow' else max(1,int(a.rate*duration/clients/2)))
@@ -224,14 +247,20 @@ def main():
                                       resource_profile=a.resources, server_cpu_limit=resource['server_cpus'],
                                       platform_id=platform_id,variant=v,scenario=f'{backend}/{clients}/{concurrency}/{mode}/{rate}rps',repeat=repeat,
                                       oom=any(x['State']['OOMKilled'] for x in states.values()) or any(counters(raw).get('oom',0)>0 for raw in after.values()) or counters(result['loadgen_cgroup']['memory.events']).get('oom',0)>0,redis_oom=int(rc.get('errorstat_OOM','count=0').split('=')[-1])>0,
-                                      cpu_throttled=throttled,
+                                      cpu_throttled=throttled and not pk, quota_throttled=throttled,
                                       loadgen_peak_bytes=int(result['loadgen_cgroup']['memory.peak']),
                                       server_cpu_pct=cpu['server']['usage_usec']/diagnostic_seconds/10000,
                                       server_rss_bytes=int(after['server'].split('VmRSS:')[1].split()[0])*1024,
                                       redis_memory_bytes=int(rc['used_memory']), redis_connections=int(rc['connected_clients']),
-                                      correctness_mismatch=v not in ('baseline','governor') and result['http_200']!=result['expected_admissions'],memory_peak_bytes=int(after['server'].split('MEMORY\n')[1].splitlines()[1]),
-                                      quota_exceeded=v not in ('baseline','governor') and result['max_admissions_per_client']>limit,
-                                      correctness='not applicable' if v=='baseline' else ('GCRA; non-equivalent semantics' if v=='governor' else ('known historical defects' if v=='v0.1.2' else 'strict sliding window burst')),
+                                      correctness_mismatch=variants.VARIANTS[v]['oracle'] and result['http_200']!=result['expected_admissions'],
+                                      memory_peak_bytes=int(after['server'].split('MEMORY\n')[1].splitlines()[1]),
+                                      quota_exceeded=variants.VARIANTS[v]['oracle'] and result['max_admissions_per_client']>limit,
+                                      observed_nominal_excess=max(0,result['max_admissions_per_client']-limit),
+                                      http_version='4.18.1',resource_layout_id=hashlib.sha256(json.dumps(resource,sort_keys=True).encode()).hexdigest()[:12],
+                                      quota=limit,window_seconds=duration+a.warmup+60,
+                                      algorithm=variants.VARIANTS[v]['algorithm'], workload='pk' if pk else 'cost',
+                                      equivalence_group='exact-log' if v in ('head','v0.2.1') else v,
+                                      correctness='first-window burst oracle' if variants.VARIANTS[v]['oracle'] else 'non-equivalent policy; observations only',
                                       diagnostics=dict(before=before,after=after,cpu=cpu,samples=samples,redis=rc,containers=states))
                         rounds.append(result)
                     except Exception as error:

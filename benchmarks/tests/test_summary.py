@@ -52,3 +52,23 @@ class ResourceTest(unittest.TestCase):
 
     def test_four_cpu_ci_can_avoid_sharing(self):
         self.assertFalse(resources.layout('ci',4)['shared_cpuset'])
+
+
+class PKTest(unittest.TestCase):
+    def test_pk_layout_reserves_generator_capacity(self):
+        config=resources.layout('pk',4)
+        self.assertEqual((config['loadgen_cpus'],config['server_cpus'],config['redis_cpus']),(2,1,1))
+        self.assertFalse(config['shared_cpuset'])
+        with self.assertRaises(ValueError): resources.layout('pk',3)
+
+    def test_pk_never_qualifies_single_round(self):
+        fixture=SummaryTest().fixture()
+        fixture.update(workload='pk',loadgen_cpu_pct=10,loadgen_cpu_limit=2,scheduled_latency={'p99_ms':1})
+        with tempfile.TemporaryDirectory() as tmp:
+            folder=Path(tmp)
+            (folder/'raw.json').write_text(json.dumps({'rounds':[fixture]}))
+            (folder/'environment.json').write_text(json.dumps({'profile':{'profile':'pk'}}))
+            content=summary.render(folder,'success')
+        self.assertIn('High-load PK qualification',content)
+        self.assertIn('fewer than five repeats',content)
+        self.assertNotIn('all criteria met',content)

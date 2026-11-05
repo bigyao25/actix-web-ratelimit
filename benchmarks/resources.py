@@ -2,6 +2,11 @@
 
 
 def layout(profile, cpus):
+    if profile=='pk':
+        if cpus<4:
+            raise ValueError('PK requires four native Docker CPUs; limits will not be shared or removed')
+        return dict(server_cpus=1,loadgen_cpus=2,redis_cpus=1,workers=1,
+                    server_cpuset='2',loadgen_cpuset='0,1',redis_cpuset='3',shared_cpuset=False)
     if profile=='ci':
         if cpus<2:
             raise ValueError('CI requires at least two Docker CPUs')

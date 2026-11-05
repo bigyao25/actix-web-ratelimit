@@ -62,7 +62,7 @@ def percentiles(values):
             for p in (50, 95, 99)}
 
 
-def phase(seconds, rate, concurrency, clients, prefix):
+def phase(seconds, rate, concurrency, clients, prefix, capture=None):
     results, pending, connections = [], set(), []
     dropped_capacity = dropped_late = 0
     activity = Activity()
@@ -95,6 +95,12 @@ def phase(seconds, rate, concurrency, clients, prefix):
     finally:
         for connection in connections:
             connection.close()
+    if capture is not None:
+        capture.extend(results)
+    return summarize_results(results,seconds,rate,elapsed,completed_in_window,activity,concurrency,dropped_capacity,dropped_late)
+
+
+def summarize_results(results,seconds,rate,elapsed,completed_in_window,activity,concurrency,dropped_capacity=0,dropped_late=0):
     counts = collections.Counter(s for _,s,_,_,_ in results)
     admissions = collections.Counter(c for c,s,_,_,_ in results if s==200)
     attempts = collections.Counter(c for c,s,_,_,_ in results if s in (200,429))
