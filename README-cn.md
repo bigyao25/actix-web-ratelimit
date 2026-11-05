@@ -28,8 +28,12 @@
 ```toml
 [dependencies]
 actix-web-ratelimit = "0.2"
+```
 
-# Redis support is enabled by default. For a memory-only build:
+Redis 支持默认启用。如果只使用内存存储，请改用以下配置：
+
+```toml
+[dependencies]
 actix-web-ratelimit = { version = "0.2", default-features = false }
 ```
 
@@ -38,126 +42,87 @@ actix-web-ratelimit = { version = "0.2", default-features = false }
 ### 基础用法（内存存储）
 
 ```rust,no_run
-# use actix_web::{web, App, HttpResponse, HttpServer};
-# use actix_web_ratelimit::{RateLimit, config::RateLimitConfig, store::MemoryStore};
-# #[cfg(feature = "redis")]
-# use actix_web_ratelimit::store::RedisStore;
-# use std::sync::Arc;
-# async fn example() -> std::io::Result<()> {
-# async fn index() -> HttpResponse { HttpResponse::Ok().finish() }
+use actix_web::{web, App, HttpServer};
+use actix_web_ratelimit::{RateLimit, config::RateLimitConfig, store::MemoryStore};
+use std::sync::Arc;
+
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
     // 配置限流：10 秒窗口内允许 3 个请求
     let config = RateLimitConfig::default().max_requests(3).window_secs(10);
-    // 创建内存存储用于跟踪请求时间戳
+
+    // 创建内存存储，在 HTTP worker 之间共享
     let store = Arc::new(MemoryStore::new());
 
     HttpServer::new(move || {
         App::new()
             // 创建并注册限流中间件
             .wrap(RateLimit::new(config.clone(), store.clone()))
-            .route("/", web::get().to(index))
+            .route("/", web::get().to(|| async { "Hello world!" }))
     })
     .bind(("127.0.0.1", 8080))?
     .run()
     .await
-# }
+}
 ```
+
+在应用上注册限流中间件，Store 应在 HTTP worker 之间共享。完整代码见 [examples/simple.rs](examples/simple.rs)。
 
 ### 高级配置
 
-```rust,no_run
-# use actix_web::{web, App, HttpResponse, HttpServer};
-# use actix_web_ratelimit::{RateLimit, config::RateLimitConfig, store::MemoryStore};
-# #[cfg(feature = "redis")]
-# use actix_web_ratelimit::store::RedisStore;
-# use std::sync::Arc;
-# async fn example() -> std::io::Result<()> {
-# async fn index() -> HttpResponse { HttpResponse::Ok().finish() }
-    let store = Arc::new(MemoryStore::new());
-    let config = RateLimitConfig::default()
-        .namespace("api")
-        .max_requests(3)
-        .window_secs(10)
-        // Extract a client identifier. The default is the peer IP without its source port.
-        .id(|req| {
-            req.headers()
-                .get("X-Client-Id")
-                .and_then(|h| h.to_str().ok())
-                .unwrap_or("anonymous")
-                .to_string()
-        })
-        // 限流超出时的自定义处理器。默认返回 429 响应。
-        .exceeded(|id, config, _req| {
-            HttpResponse::TooManyRequests().body(format!(
-                "429 caused: client-id: {}, limit: {}req/{:?}",
-                id, config.max_requests, config.window_secs
-            ))
-        });
+此示例通过 `.id(...)` 读取 `X-Client-Id` 请求头作为客户端标识；请求头缺失或不是有效文本时，使用 `anonymous`。基础示例仍按连接对端 IP 限流，不使用该请求头。生产环境应先验证请求头，避免客户端伪造标识绕过限流。
 
-    HttpServer::new(move || {
-        App::new()
-            .wrap(RateLimit::new(config.clone(), store.clone()))
-            .route("/", web::get().to(index))
+```rust
+use actix_web::HttpResponse;
+use actix_web_ratelimit::config::RateLimitConfig;
+
+let config = RateLimitConfig::default()
+    .namespace("api")
+    .max_requests(3)
+    .window_secs(10)
+    // 从请求头提取客户端标识；默认使用不含源端口的连接对端 IP
+    .id(|req| {
+        req.headers().get("X-Client-Id")
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("anonymous")
+            .to_owned()
     })
-    .bind(("127.0.0.1", 8080))?
-    .run()
-    .await
-# }
+    // 自定义超出限额时的响应；默认返回 HTTP 429
+    .exceeded(|_id, _config, _req| {
+        HttpResponse::TooManyRequests().body("Rate limit exceeded")
+    });
 ```
+
+完整的请求头识别和自定义限流响应代码见 [examples/advance.rs](examples/advance.rs)。
 
 ### Redis 存储
 
-`redis` 特性默认启用；关闭默认特性后，可以显式启用：
+`redis` 特性默认启用，快速开始中的依赖配置已包含 Redis 支持。如果需要关闭默认特性并仅显式启用 Redis 支持，请使用：
 
 ```toml
-actix-web-ratelimit = { version = "0.2", features = [ "redis" ] }
+[dependencies]
+actix-web-ratelimit = { version = "0.2", default-features = false, features = ["redis"] }
 ```
 
 在启动 HTTP worker 前创建一次 Store：
 
-```rust,no_run
-# use actix_web::{web, App, HttpResponse, HttpServer};
-# use actix_web_ratelimit::{RateLimit, config::RateLimitConfig, store::MemoryStore};
-# #[cfg(feature = "redis")]
-# use actix_web_ratelimit::store::RedisStore;
-# use std::sync::Arc;
-# #[cfg(feature = "redis")]
-# async fn example() -> std::io::Result<()> {
-# async fn index() -> HttpResponse { HttpResponse::Ok().finish() }
-    let store = Arc::new(
-        RedisStore::new("redis://127.0.0.1/0")
-            .await
-            .expect("连接 Redis 失败")
-            // Redis 键的自定义前缀
-            .with_prefix("myapp:ratelimit:"),
-    );
-    let config = RateLimitConfig::default().max_requests(3).window_secs(10);
+```rust,ignore
+use actix_web_ratelimit::store::RedisStore;
+use std::sync::Arc;
 
-    HttpServer::new(move || {
-        App::new()
-            .wrap(RateLimit::new(config.clone(), store.clone()))
-            .route("/", web::get().to(index))
-    })
-    .bind(("127.0.0.1", 8080))?
-    .run()
-    .await
-# }
+// 像基础示例一样，将 store 传入 RateLimit::new(config.clone(), store.clone())。
+let store = Arc::new(
+    RedisStore::new("redis://127.0.0.1/0").await?
+        // Redis 键的自定义前缀
+        .with_prefix("myapp:ratelimit:"),
+);
 ```
+
+异步初始化、键前缀及中间件注册的完整代码见 [examples/redis.rs](examples/redis.rs)。
 
 `RedisStore::new(url).await` 默认使用 1 秒超时和 `FailurePolicy::FailOpen`：Redis 出错时放行。可以使用 `with_options` 配置超时，并在后端失败时返回 HTTP 503：
 
-```rust,no_run
-# #[cfg(feature = "redis")]
-# async fn example() -> Result<(), Box<dyn std::error::Error>> {
-use actix_web_ratelimit::store::{FailurePolicy, RedisStore, RedisStoreOptions};
-use std::time::Duration;
-
-let store = RedisStore::with_options("redis://127.0.0.1/0", RedisStoreOptions {
-    timeout: Duration::from_millis(250),
-    failure_policy: FailurePolicy::FailClosed,
-}).await?;
-# Ok(())
-# }
-```
+通过 `RedisStoreOptions` 的 `timeout`（例如 `Duration::from_millis(250)`）和 `failure_policy: FailurePolicy::FailClosed` 设置超时及故障策略，并传入 `RedisStore::with_options(url, options).await?`。
 
 初始化错误始终返回。克隆共享异步连接并自动重连；每次检查的总超时包含重连等待。超时时，额度可能已经被记录。Redis Key 包含客户端标识，应使用非敏感 ID，避免直接使用原始 API Key。
 
@@ -220,6 +185,9 @@ Redis 使用服务端时间和 Lua 原子脚本，保证成员唯一。窗口精
 
 ```bash
 cargo run --example simple
+
+# 或者
+cargo run --example advance
 ```
 
 然后测试限流：
@@ -230,6 +198,8 @@ curl http://localhost:8080/
 
 # 通过多次请求触发限流
 for i in {1..5}; do echo "$(curl -s http://localhost:8080)\r"; done
+# 携带 Header
+for i in {1..5}; do echo "$(curl -s -H "X-Client-Id: req_00000001" http://localhost:8080)\r"; done
 ```
 
 ### 测试与基准

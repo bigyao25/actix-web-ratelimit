@@ -28,8 +28,12 @@ Add this to your `Cargo.toml`:
 ```toml
 [dependencies]
 actix-web-ratelimit = "0.2"
+```
 
-# Redis support is enabled by default. For a memory-only build:
+Redis support is enabled by default. For a memory-only build, use this instead:
+
+```toml
+[dependencies]
 actix-web-ratelimit = { version = "0.2", default-features = false }
 ```
 
@@ -38,126 +42,87 @@ actix-web-ratelimit = { version = "0.2", default-features = false }
 ### Basic Usage with In-Memory Store
 
 ```rust,no_run
-# use actix_web::{web, App, HttpResponse, HttpServer};
-# use actix_web_ratelimit::{RateLimit, config::RateLimitConfig, store::MemoryStore};
-# #[cfg(feature = "redis")]
-# use actix_web_ratelimit::store::RedisStore;
-# use std::sync::Arc;
-# async fn example() -> std::io::Result<()> {
-# async fn index() -> HttpResponse { HttpResponse::Ok().finish() }
-    // Configure rate limiting: allow 3 requests per 10-second window
+use actix_web::{web, App, HttpServer};
+use actix_web_ratelimit::{RateLimit, config::RateLimitConfig, store::MemoryStore};
+use std::sync::Arc;
+
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
+    // Allow 3 requests per 10-second window
     let config = RateLimitConfig::default().max_requests(3).window_secs(10);
-    // Create in-memory store for tracking request timestamps
+
+    // Create an in-memory store shared across HTTP workers
     let store = Arc::new(MemoryStore::new());
 
     HttpServer::new(move || {
         App::new()
-            // create and register the rate limit middleware
+            // Create and register the rate limiting middleware
             .wrap(RateLimit::new(config.clone(), store.clone()))
-            .route("/", web::get().to(index))
+            .route("/", web::get().to(|| async { "Hello world!" }))
     })
     .bind(("127.0.0.1", 8080))?
     .run()
     .await
-# }
+}
 ```
+
+Register the rate limiting middleware on your app and share the store across HTTP workers. Full example: [examples/simple.rs](examples/simple.rs).
 
 ### Advanced Configuration
 
-```rust,no_run
-# use actix_web::{web, App, HttpResponse, HttpServer};
-# use actix_web_ratelimit::{RateLimit, config::RateLimitConfig, store::MemoryStore};
-# #[cfg(feature = "redis")]
-# use actix_web_ratelimit::store::RedisStore;
-# use std::sync::Arc;
-# async fn example() -> std::io::Result<()> {
-# async fn index() -> HttpResponse { HttpResponse::Ok().finish() }
-    let store = Arc::new(MemoryStore::new());
-    let config = RateLimitConfig::default()
-        .namespace("api")
-        .max_requests(3)
-        .window_secs(10)
-        // Extract a client identifier. The default is the peer IP without its source port.
-        .id(|req| {
-            req.headers()
-                .get("X-Client-Id")
-                .and_then(|h| h.to_str().ok())
-                .unwrap_or("anonymous")
-                .to_string()
-        })
-        // Custom handler for rate limit exceeded. It returns a 429 response by default.
-        .exceeded(|id, config, _req| {
-            HttpResponse::TooManyRequests().body(format!(
-                "429 caused: client-id: {}, limit: {}req/{:?}",
-                id, config.max_requests, config.window_secs
-            ))
-        });
+This example uses `.id(...)` to read the `X-Client-Id` header as the client identifier, falling back to `anonymous` when the header is missing or is not valid text. The basic example still limits by peer IP and does not use this header. Validate the header in production to prevent clients from bypassing limits with forged identifiers.
 
-    HttpServer::new(move || {
-        App::new()
-            .wrap(RateLimit::new(config.clone(), store.clone()))
-            .route("/", web::get().to(index))
+```rust
+use actix_web::HttpResponse;
+use actix_web_ratelimit::config::RateLimitConfig;
+
+let config = RateLimitConfig::default()
+    .namespace("api")
+    .max_requests(3)
+    .window_secs(10)
+    // Extract a client identifier; the default is the peer IP without its source port
+    .id(|req| {
+        req.headers().get("X-Client-Id")
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or("anonymous")
+            .to_owned()
     })
-    .bind(("127.0.0.1", 8080))?
-    .run()
-    .await
-# }
+    // Customize the limit-exceeded response; the default is HTTP 429
+    .exceeded(|_id, _config, _req| {
+        HttpResponse::TooManyRequests().body("Rate limit exceeded")
+    });
 ```
+
+For header-based identification and a custom rate limit response, see [examples/advance.rs](examples/advance.rs).
 
 ### Redis Store
 
-The `redis` feature is enabled by default. Enable it explicitly if default features are disabled:
+The `redis` feature is enabled by default, so the Quick Start dependency already includes Redis support. To disable default features and enable only Redis support explicitly, use:
 
 ```toml
-actix-web-ratelimit = { version = "0.2", features = [ "redis" ] }
+[dependencies]
+actix-web-ratelimit = { version = "0.2", default-features = false, features = ["redis"] }
 ```
 
 Create the store once, before starting HTTP workers:
 
-```rust,no_run
-# use actix_web::{web, App, HttpResponse, HttpServer};
-# use actix_web_ratelimit::{RateLimit, config::RateLimitConfig, store::MemoryStore};
-# #[cfg(feature = "redis")]
-# use actix_web_ratelimit::store::RedisStore;
-# use std::sync::Arc;
-# #[cfg(feature = "redis")]
-# async fn example() -> std::io::Result<()> {
-# async fn index() -> HttpResponse { HttpResponse::Ok().finish() }
-    let store = Arc::new(
-        RedisStore::new("redis://127.0.0.1/0")
-            .await
-            .expect("Failed to connect to Redis")
-            // Custom prefix for Redis keys
-            .with_prefix("myapp:ratelimit:"),
-    );
-    let config = RateLimitConfig::default().max_requests(3).window_secs(10);
+```rust,ignore
+use actix_web_ratelimit::store::RedisStore;
+use std::sync::Arc;
 
-    HttpServer::new(move || {
-        App::new()
-            .wrap(RateLimit::new(config.clone(), store.clone()))
-            .route("/", web::get().to(index))
-    })
-    .bind(("127.0.0.1", 8080))?
-    .run()
-    .await
-# }
+// Register with RateLimit::new(config.clone(), store.clone()), as above.
+let store = Arc::new(
+    RedisStore::new("redis://127.0.0.1/0").await?
+        // Custom prefix for Redis keys
+        .with_prefix("myapp:ratelimit:"),
+);
 ```
+
+For asynchronous initialization, key prefixes and middleware registration, see [examples/redis.rs](examples/redis.rs).
 
 `RedisStore::new(url).await` uses a one-second deadline and `FailurePolicy::FailOpen`: Redis errors allow requests. Use `with_options` to configure the deadline and return HTTP 503 on backend failures:
 
-```rust,no_run
-# #[cfg(feature = "redis")]
-# async fn example() -> Result<(), Box<dyn std::error::Error>> {
-use actix_web_ratelimit::store::{FailurePolicy, RedisStore, RedisStoreOptions};
-use std::time::Duration;
-
-let store = RedisStore::with_options("redis://127.0.0.1/0", RedisStoreOptions {
-    timeout: Duration::from_millis(250),
-    failure_policy: FailurePolicy::FailClosed,
-}).await?;
-# Ok(())
-# }
-```
+Pass `RedisStoreOptions` with `timeout` (for example, `Duration::from_millis(250)`) and `failure_policy: FailurePolicy::FailClosed` to `RedisStore::with_options(url, options).await?`.
 
 Initialization errors are always returned. Clones reuse an asynchronous connection and reconnect automatically. Each check has a total deadline including reconnect waits; a timeout may occur after quota has already been recorded. Redis keys contain the client identifier, so use non-secret IDs rather than raw API keys.
 
@@ -220,6 +185,9 @@ Run the example:
 
 ```bash
 cargo run --example simple
+
+# Or
+cargo run --example advance
 ```
 
 Then test the rate limiting:
@@ -230,6 +198,8 @@ curl http://localhost:8080/
 
 # Exceed rate limit by making many requests
 for i in {1..5}; do echo "$(curl -s http://localhost:8080)\r"; done
+# With Header
+for i in {1..5}; do echo "$(curl -s -H "X-Client-Id: req_00000001" http://localhost:8080)\r"; done
 ```
 
 ### Tests and Benchmarks

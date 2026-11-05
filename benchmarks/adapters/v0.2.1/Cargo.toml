@@ -1,0 +1,14 @@
+[package]
+name = "bench-server"
+version = "0.0.0"
+edition = "2024"
+publish = false
+[workspace]
+[features]
+default = ["modern"]
+baseline = []
+legacy = []
+modern = []
+[dependencies]
+actix-web = { version = "=4.18.1", default-features = false, features = ["macros"] }
+limiter = { package = "actix-web-ratelimit", version = "=0.2.1" }

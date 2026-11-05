@@ -1,0 +1,9 @@
+[package]
+name = "bench-loadgen"
+version = "0.0.0"
+edition = "2024"
+publish = false
+[workspace]
+[dependencies]
+tokio = { version = "=1.54.1", features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync"] }
+serde_json = "=1.0.154"

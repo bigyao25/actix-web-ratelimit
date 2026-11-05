@@ -1,0 +1,47 @@
+services:
+  redis:
+    image: ${REDIS_IMAGE:-redis:7.4.9-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99}
+    command: [redis-server, --save, '', --appendonly, 'no', --maxmemory, 256mb, --maxmemory-policy, noeviction]
+    cpus: ${REDIS_CPUS:-1}
+    cpuset: ${REDIS_CPUSET:-3}
+    mem_limit: 512m
+    memswap_limit: 512m
+    pids_limit: 64
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 1s
+      timeout: 1s
+      retries: 30
+  server:
+    image: ${SERVER_IMAGE}
+    cpus: ${SERVER_CPUS:-2}
+    cpuset: ${SERVER_CPUSET:-1,2}
+    mem_limit: 1g
+    memswap_limit: 1g
+    pids_limit: 128
+    environment:
+      BACKEND: ${BACKEND}
+      LIMIT: ${LIMIT}
+      WINDOW: ${WINDOW}
+      WORKERS: ${WORKERS:-2}
+    depends_on:
+      redis:
+        condition: service_healthy
+  loadgen:
+    image: ${LOADGEN_IMAGE:-ratelimit-bench-loadgen:local}
+    cpus: ${LOADGEN_CPUS:-1}
+    cpuset: ${LOADGEN_CPUSET:-0}
+    mem_limit: 512m
+    memswap_limit: 512m
+    pids_limit: 600
+    environment:
+      LIMIT: ${LIMIT}
+      RATE: ${RATE}
+      CONCURRENCY: ${CONCURRENCY}
+      CLIENTS: ${CLIENTS}
+      DURATION: ${DURATION}
+      WARMUP: ${WARMUP}
+    depends_on: [server]
+networks:
+  default:
+    internal: true

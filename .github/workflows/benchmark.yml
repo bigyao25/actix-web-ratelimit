@@ -1,0 +1,61 @@
+name: Benchmark PK
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: 'High-load competitor PK (4 CPUs) or short operational smoke'
+        required: true
+        default: pk
+        type: choice
+        options: [pk, smoke]
+permissions:
+  contents: read
+concurrency:
+  group: benchmark-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Test benchmark tooling
+        run: python3 -m unittest discover -s benchmarks/tests -v
+      - name: Build and run bounded comparison
+        id: benchmark
+        env:
+          BENCHMARK_SUITE: ${{ inputs.suite }}
+        run: |
+          mkdir -p benchmarks/results/ci
+          set -o pipefail
+          if [ "$BENCHMARK_SUITE" = pk ]; then
+            resource=pk
+            variants=(baseline head governor trypema extensible)
+          else
+            resource=ci
+            variants=(baseline head v0.1.2 v0.2.1 governor trypema extensible)
+          fi
+          python3 benchmarks/bench.py "$BENCHMARK_SUITE" --resources "$resource" --variants "${variants[@]}" --backends memory redis --output benchmarks/results/ci 2>&1 | tee benchmarks/results/ci/run.log
+      - name: Generate assessment even on failure
+        if: always()
+        env:
+          BENCHMARK_STATUS: ${{ steps.benchmark.outcome }}
+        run: python3 benchmarks/summary.py benchmarks/results/ci --status "$BENCHMARK_STATUS" --output benchmarks/results/ci/assessment.md
+      - name: Upload reports and raw diagnostics
+        id: artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-diagnostics
+          path: benchmarks/results/ci/
+          retention-days: 14
+          if-no-files-found: warn
+      - name: Publish workflow assessment
+        if: always()
+        env:
+          BENCHMARK_STATUS: ${{ steps.benchmark.outcome }}
+          BENCHMARK_ARTIFACT_URL: ${{ steps.artifact.outputs.artifact-url }}
+        run: python3 benchmarks/summary.py benchmarks/results/ci --status "$BENCHMARK_STATUS" --output benchmarks/results/ci/assessment.md --github-summary
