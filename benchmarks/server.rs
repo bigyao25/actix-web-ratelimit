@@ -26,5 +26,5 @@ async fn main() -> std::io::Result<()> {
         #[cfg(not(feature = "baseline"))]
         let app = app.wrap(RateLimit::new(config.clone(), store.clone()));
         app.default_service(web::to(handler))
-    }).workers(number("WORKERS", 2)).bind(("0.0.0.0", 8080))?.run().await
+    }).workers(number("WORKERS", 2)).keep_alive(std::time::Duration::from_secs(120)).bind(("0.0.0.0", 8080))?.run().await
 }

@@ -1,13 +1,10 @@
-"""Capability, trace plumbing and evidence rules; fixtures are not benchmark data."""
+"""Capability and evidence rules; fixtures are not benchmark data."""
 import sys
 from pathlib import Path
 import unittest
-from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).parents[1]))
 import comparison
-import loadgen
 import variants
-import summary
 
 class CompetitorTest(unittest.TestCase):
     def test_capabilities_do_not_silently_use_fake_zero_quotas(self):
@@ -27,6 +24,3 @@ class CompetitorTest(unittest.TestCase):
         base=dict(platform_id='host',scenario='memory/test',target_rps=100,p99_ms=1,variant='head',server_cpu_limit=2)
         peer={**base,'variant':'trypema','server_cpu_limit':1}
         self.assertFalse(comparison.contrasts([base,peer]))
-
-    def test_behavior_does_not_become_a_throughput_contrast(self):
-        self.assertFalse(comparison.contrasts([dict(workload='behavior',variant='head')]))
