@@ -28,13 +28,18 @@ def validate(round_):
         if not isinstance(round_[key], bool):
             reasons.append("invalid " + key)
         elif round_[key]:
-            reasons.append(key)
+            if key!='loadgen_saturated' or round_.get('schema_version',0)<3:
+                reasons.append(key)
     for key in ("http_503", "http_other", "errors"):
         if round_[key]:
             reasons.append(key)
+    if round_.get('schema_version',0)>=3 and round_.get('dropped_late',0)>0:
+        reasons.append('scheduler_drops')
+    if any(reason.startswith('invalid ') for reason in reasons):
+        return reasons
     if not reasons and not round_["p50_ms"] <= round_["p95_ms"] <= round_["p99_ms"]:
         reasons.append("inconsistent latency percentiles")
-    if round_.get('schema_version') == 2 and (not reasons or set(reasons)<={'correctness_mismatch','quota_exceeded'}):
+    if round_.get('schema_version',0)>=2:
         total=sum(round_[k] for k in ('http_200','http_429','http_503','http_other','errors'))
         if total != round_.get('sample_count') or total+round_.get('dropped',0) != round_.get('scheduled'):
             reasons.append('request accounting mismatch')
@@ -42,6 +47,30 @@ def validate(round_):
             reasons.append('completion RPS exceeds offered RPS')
         if not 0 <= round_.get('mean_in_flight',-1) <= round_.get('peak_in_flight',-1) <= round_.get('concurrency_limit',-1):
             reasons.append('invalid measured concurrency')
+    if round_.get('schema_version',0)>=3:
+        categories=round_.get('error_categories')
+        if not isinstance(categories,dict) or any(not isinstance(v,int) or isinstance(v,bool) or v<0 for v in categories.values()):
+            reasons.append('missing/invalid error categories')
+        elif sum(categories.values())!=round_['errors']:
+            reasons.append('error category accounting mismatch')
+        if round_.get('dropped_capacity',0)+round_.get('dropped_late',0)!=round_.get('dropped'):
+            reasons.append('drop accounting mismatch')
+        if round_.get('loadgen_saturated') != (round_.get('dropped',0)>0):
+            reasons.append('drop flag mismatch')
+    return reasons
+
+
+def invalid_comparison_baseline(row):
+    return row.get('workload') in ('comparison','pk') and row.get('variant')=='baseline' and bool(validate(row))
+
+
+def load_failures(row):
+    reasons=[]
+    if row.get('dropped_capacity',0)>0: reasons.append('in-flight limit reached')
+    if row.get('workload') in ('comparison','pk'):
+        if row.get('http_rps',row.get('achieved_rps',0))<.99*row.get('target_rps',1): reasons.append('HTTP completion below 99%')
+        if (row.get('scheduled_latency',{}).get('p99_ms') or float('inf'))>10: reasons.append('scheduled p99 above 10ms')
+        if row.get('loadgen_cpu_pct',float('inf'))>=85*row.get('loadgen_cpu_limit',1): reasons.append('loadgen CPU pressure')
     return reasons
 
 
@@ -50,8 +79,8 @@ def summarize(data):
     annotated = []
     for item in data["rounds"]:
         reasons = validate(item)
-        annotated.append({**item, "invalid_reasons": reasons})
-        if not reasons:
+        annotated.append({**item, "invalid_reasons": reasons, "load_failure_reasons": load_failures(item)})
+        if not reasons and not load_failures(item):
             key = (item["platform_id"], item["variant"], item["scenario"], item.get("target_rps"), item.get("measurement_seconds"), item.get("warmup_seconds"))
             groups.setdefault(key, []).append(item)
     rows = []
@@ -82,7 +111,7 @@ def summarize(data):
 
 
 def markdown(result):
-    lines = ["# Benchmark report", "", "Only rounds passing validation are summarized.", "",
+    lines = ["# Benchmark report", "", "Only measurement-clean rounds passing their load criteria are summarized; clean overload observations remain in raw tables.", "",
              "| Platform | Variant | Scenario | Rounds | Median RPS | Range RPS | Median p99 ms |",
              "| --- | --- | --- | ---: | ---: | ---: | ---: |"]
     esc = lambda s: str(s).replace("|", "\\|").replace("\n", " ")
@@ -122,6 +151,13 @@ def markdown(result):
     for r in result['rounds']:
         for status, values in r.get('status_latency',{}).items():
             lines.append('| '+esc(str(r.get('variant'))+' / '+str(r.get('scenario')))+' | '+status+' | '+' | '.join(fmt(values.get(k)) for k in ('p50_ms','p95_ms','p99_ms'))+' |')
+    lines += ['', '## Measurement quality versus load outcome', '',
+              '| Variant / scenario | Measurement | Load outcome | HTTP RPS | Transport categories | Capacity / scheduler drops |',
+              '| --- | --- | --- | ---: | --- | ---: |']
+    for r in result['rounds']:
+        quality='invalid: '+', '.join(r['invalid_reasons']) if r['invalid_reasons'] else 'clean'
+        load=', '.join(r.get('load_failure_reasons',[])) or 'criteria met / not applicable'
+        lines.append('| '+esc(str(r.get('variant'))+' / '+str(r.get('scenario')))+' | '+esc(quality)+' | '+esc(load)+' | '+fmt(r.get('http_rps'))+' | '+esc(str(r.get('error_categories','legacy: unknown')))+' | '+str(r.get('dropped_capacity','N/A'))+' / '+str(r.get('dropped_late','N/A'))+' |')
     return "\n".join(lines) + "\n"
 
 

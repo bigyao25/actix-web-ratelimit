@@ -35,7 +35,7 @@ No algorithm or failure policy is rewritten for a better score.
 
 ## High-load comparison
 
-The user-facing comparison is now the manual `pk` suite, with the native generator
+The user-facing comparison is now the manual `compare` suite, with the native generator
 and identical resource limits for each variant. Low-load behavior probes have been
 removed. Assertions use the shared long first-window oracle where applicable;
 GCRA and best-effort bucketed admission remain explicitly non-equivalent. Their

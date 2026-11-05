@@ -81,9 +81,9 @@ behavior suite; manually dispatched CI smoke adds both new competitors. The
 benchmark workflow has no automatic push or pull-request trigger.
 
 
-## High-load PK revision
+## High-load high-load comparison revision
 
-Low-load behavior entry points were removed. Manual Workflow defaults to `pk`,
+Low-load behavior entry points were removed. Manual Workflow defaults to `compare`,
 using a native Rust/Tokio pooled HTTP/1.1 generator with bounded tasks/histograms.
 Default rates are 10k/30k/60k, five repeats; resources are disjoint 2/1/1 CPUs for
 loadgen/server/Redis. Safe/smoke resource defaults remain available separately.
@@ -94,9 +94,34 @@ repeat): 8 valid; extensible Memory dropped 111 scheduled arrivals at the in-fli
 cap and was excluded. Its loadgen CPU did not establish generator CPU saturation;
 no causal server bottleneck or performance winner is claimed. Every other cell
 completed the planned 30,000 requests. This is a high-arrival-rate integration
-check, not the full repeated PK qualification. Full defaults remain manual-only.
+check, not the full repeated high-load comparison qualification. Full defaults remain manual-only.
 
-In PK, intentional SUT CPU-quota throttling is retained as a pressure signal, not
+In high-load comparison, intentional SUT CPU-quota throttling is retained as a pressure signal, not
 solely an invalidity reason. Request loss, protocol/transport errors, OOM and
 asserted quota errors still invalidate. Qualification is scoped to matching
 backend/client/concurrency/mode and tested rates; generator pressure blocks it.
+
+
+## Connection lifecycle and reporting regression
+
+Native schema 3 uses FIFO idle reuse, 4-second idle retirement, pre-write idle
+socket checks, complete stage/kind error counters and bounded timestamped examples.
+There is no automatic request replay. Every benchmark adapter now explicitly uses
+120-second server Keep-Alive. Production limiter sources and dependencies are unchanged.
+Seven native tests pass, including a real five-second peer idle-close test, earlier
+EOF retirement and classification of post-write EOF without replay. Tool tests
+cover error/drop accounting even on failure and baseline fail-fast decisions.
+
+A native 10k RPS regression used 5-second warmup and 20-second measurement for
+baseline/HEAD on Memory/Redis. All four rounds had zero transport errors and zero
+scheduler drops. Baseline Memory and HEAD Redis each returned all 200,000 HTTP
+200 responses. HEAD Memory and baseline Redis had 22 and 19 capacity drops,
+respectively: clean measurements but failed load levels, not qualified winners.
+This is local lifecycle evidence, not proof of the root cause of every earlier
+GitHub failure or a replacement for five-repeat comparison on that runner.
+
+Measurement quality and load outcomes are now separate. Capacity-only drops in
+schema 3 remain visible and exclude the rate/cost comparison without invalidating
+the measurement. Errors, scheduler loss, OOM and bad accounting still invalidate.
+Old schema-2 raw results are not rewritten. high-load comparison persists and aborts if a baseline
+measurement is invalid, preventing a long matrix after failed client calibration.

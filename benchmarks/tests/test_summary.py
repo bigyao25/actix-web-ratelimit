@@ -54,21 +54,45 @@ class ResourceTest(unittest.TestCase):
         self.assertFalse(resources.layout('ci',4)['shared_cpuset'])
 
 
-class PKTest(unittest.TestCase):
-    def test_pk_layout_reserves_generator_capacity(self):
-        config=resources.layout('pk',4)
+class ComparisonTest(unittest.TestCase):
+    def test_comparison_layout_reserves_generator_capacity(self):
+        config=resources.layout('comparison',4)
         self.assertEqual((config['loadgen_cpus'],config['server_cpus'],config['redis_cpus']),(2,1,1))
         self.assertFalse(config['shared_cpuset'])
-        with self.assertRaises(ValueError): resources.layout('pk',3)
+        with self.assertRaises(ValueError): resources.layout('comparison',3)
 
-    def test_pk_never_qualifies_single_round(self):
+    def test_comparison_never_qualifies_single_round(self):
         fixture=SummaryTest().fixture()
-        fixture.update(workload='pk',loadgen_cpu_pct=10,loadgen_cpu_limit=2,scheduled_latency={'p99_ms':1})
+        fixture.update(workload='comparison',loadgen_cpu_pct=10,loadgen_cpu_limit=2,scheduled_latency={'p99_ms':1})
         with tempfile.TemporaryDirectory() as tmp:
             folder=Path(tmp)
             (folder/'raw.json').write_text(json.dumps({'rounds':[fixture]}))
-            (folder/'environment.json').write_text(json.dumps({'profile':{'profile':'pk'}}))
+            (folder/'environment.json').write_text(json.dumps({'profile':{'profile':'compare'}}))
             content=summary.render(folder,'success')
-        self.assertIn('High-load PK qualification',content)
+        self.assertIn('High-load benchmark qualification',content)
         self.assertIn('fewer than five repeats',content)
         self.assertNotIn('all criteria met',content)
+
+class QualitySummaryTest(unittest.TestCase):
+    def test_baseline_errors_prioritize_client_diagnostics(self):
+        fixture=SummaryTest().fixture()
+        fixture.update(variant='baseline',errors=1,error_categories={'read_status:eof':1})
+        with tempfile.TemporaryDirectory() as tmp:
+            folder=Path(tmp)
+            (folder/'raw.json').write_text(json.dumps({'rounds':[fixture]}))
+            content=summary.render(folder,'success')
+        self.assertIn('Measurement quality: **failed**',content)
+        self.assertIn('Baseline also has transport errors',content)
+        self.assertIn('read_status:eof',content)
+        self.assertNotIn('If no pressure was demonstrated',content)
+
+    def test_clean_capacity_limited_round_is_not_a_clean_pass(self):
+        from test_report import SchemaThreeTest
+        fixture=SchemaThreeTest().fixture()
+        with tempfile.TemporaryDirectory() as tmp:
+            folder=Path(tmp)
+            (folder/'raw.json').write_text(json.dumps({'rounds':[fixture]}))
+            content=summary.render(folder,'success')
+        self.assertIn('measurement-clean: **1**',content)
+        self.assertIn('Clean rounds failing load criteria: **1**',content)
+        self.assertIn('In-flight bounds were reached',content)

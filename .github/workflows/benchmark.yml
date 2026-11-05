@@ -1,20 +1,20 @@
-name: Benchmark PK
+name: High-load Benchmarks
 on:
   workflow_dispatch:
     inputs:
       suite:
-        description: 'High-load competitor PK (4 CPUs) or short operational smoke'
+        description: 'High-load comparative benchmarks (4 CPUs) or short operational smoke'
         required: true
-        default: pk
+        default: compare
         type: choice
-        options: [pk, smoke]
+        options: [compare, smoke]
 permissions:
   contents: read
 concurrency:
   group: benchmark-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 jobs:
-  smoke:
+  benchmark:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
@@ -31,8 +31,8 @@ jobs:
         run: |
           mkdir -p benchmarks/results/ci
           set -o pipefail
-          if [ "$BENCHMARK_SUITE" = pk ]; then
-            resource=pk
+          if [ "$BENCHMARK_SUITE" = compare ]; then
+            resource=comparison
             variants=(baseline head governor trypema extensible)
           else
             resource=ci

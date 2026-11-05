@@ -37,7 +37,7 @@ async fn main() -> std::io::Result<()> {
             .and_then(|v| v.parse().ok())
             .unwrap_or(2),
     )
-    .bind(("0.0.0.0", 8080))?
+    .keep_alive(std::time::Duration::from_secs(120)).bind(("0.0.0.0", 8080))?
     .run()
     .await
 }

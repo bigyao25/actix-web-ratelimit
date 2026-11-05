@@ -6,7 +6,7 @@ import statistics
 def contrasts(rows):
     groups=collections.defaultdict(list)
     for row in rows:
-        if row.get('workload')=='behavior' or row.get('invalid_reasons'):
+        if row.get('workload')=='behavior' or row.get('invalid_reasons') or row.get('dropped',0)>0:
             continue
         key=tuple(row.get(k) for k in ('platform_id','scenario','target_rps','measurement_seconds',
                                       'warmup_seconds','http_version','resource_layout_id','resource_profile','server_cpu_limit','loadgen_cpu_limit','quota','window_seconds'))

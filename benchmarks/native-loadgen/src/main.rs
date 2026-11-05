@@ -16,7 +16,7 @@ use tokio::{
     time::{Instant, sleep_until},
 };
 type Connection = BufReader<TcpStream>;
-type Pool = Arc<Mutex<Vec<Connection>>>;
+type Pool = Arc<ConnectionPool>;
 const BINS: usize = 80001;
 #[derive(Clone)]
 struct Histogram {
@@ -65,92 +65,163 @@ impl Histogram {
         json!({"p50_ms":self.percentile(50),"p95_ms":self.percentile(95),"p99_ms":self.percentile(99)})
     }
 }
-async fn exchange(pool: Pool, identity: String) -> io::Result<u16> {
+// Idle connections are recycled before a request is written; requests are never replayed.
+struct IdleConnection {
+    connection: Connection,
+    returned: Instant,
+}
+#[derive(Default)]
+struct PoolCounters {
+    created: AtomicUsize,
+    reused: AtomicUsize,
+    expired: AtomicUsize,
+    closed: AtomicUsize,
+}
+struct ConnectionPool {
+    idle: Mutex<std::collections::VecDeque<IdleConnection>>,
+    counters: PoolCounters,
+    idle_timeout: Duration,
+}
+fn new_pool() -> Pool {
+    Arc::new(ConnectionPool {
+        idle: Mutex::new(std::collections::VecDeque::new()),
+        counters: PoolCounters::default(),
+        idle_timeout: Duration::from_secs(4),
+    })
+}
+impl ConnectionPool {
+    fn json(&self) -> Value {
+        json!({"created":self.counters.created.load(Ordering::Relaxed),"reused":self.counters.reused.load(Ordering::Relaxed),"idle_expired":self.counters.expired.load(Ordering::Relaxed),"idle_unusable":self.counters.closed.load(Ordering::Relaxed),"idle_timeout_ms":self.idle_timeout.as_millis(),"automatic_request_retries":0})
+    }
+}
+#[derive(Debug)]
+struct ClientError {
+    stage: &'static str,
+    kind: String,
+    reused: bool,
+}
+impl ClientError {
+    fn io(stage: &'static str, error: io::Error) -> Self {
+        Self {
+            stage,
+            kind: format!("{:?}", error.kind()),
+            reused: false,
+        }
+    }
+    fn protocol(stage: &'static str, kind: &str) -> Self {
+        Self {
+            stage,
+            kind: kind.into(),
+            reused: false,
+        }
+    }
+    fn key(&self) -> String {
+        format!("{}:{}", self.stage, self.kind)
+    }
+}
+async fn exchange(pool: Pool, identity: String) -> Result<u16, ClientError> {
     exchange_at(pool, identity, "server:8080").await
 }
-async fn exchange_at(pool: Pool, identity: String, address: &str) -> io::Result<u16> {
-    let pooled = pool.lock().await.pop();
-    let mut connection = if let Some(c) = pooled {
-        c
-    } else {
-        let stream = TcpStream::connect(address).await?;
-        stream.set_nodelay(true)?;
-        BufReader::new(stream)
-    };
-    connection.write_all(format!("GET / HTTP/1.1\r\nHost: server\r\nx-bench-client: {identity}\r\nConnection: keep-alive\r\n\r\n").as_bytes()).await?;
-    let mut line = String::new();
-    connection.read_line(&mut line).await?;
-    let status = line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|v| v.parse().ok())
-        .ok_or_else(|| io::Error::other("invalid HTTP status"))?;
-    let (mut length, mut chunked, mut close) = (None, false, false);
-    let mut headers = line.len();
+async fn exchange_at(pool: Pool, identity: String, address: &str) -> Result<u16, ClientError> {
+    let mut pooled = None;
     loop {
-        line.clear();
-        if connection.read_line(&mut line).await? == 0 {
-            return Err(io::Error::other("truncated HTTP headers"));
-        }
-        headers += line.len();
-        if headers > 65536 {
-            return Err(io::Error::other("oversized HTTP headers"));
-        }
-        if line == "\r\n" {
+        let Some(idle) = pool.idle.lock().await.pop_front() else {
             break;
+        };
+        if idle.returned.elapsed() >= pool.idle_timeout {
+            pool.counters.expired.fetch_add(1, Ordering::Relaxed);
+            continue;
         }
-        if let Some((key, value)) = line.split_once(':') {
-            match key.to_ascii_lowercase().as_str() {
-                "content-length" => length = value.trim().parse::<usize>().ok(),
-                "transfer-encoding" => chunked = value.to_ascii_lowercase().contains("chunked"),
-                "connection" => close = value.to_ascii_lowercase().contains("close"),
-                _ => {}
-            }
-        }
-    }
-    if chunked {
-        let mut total = 0;
-        loop {
-            line.clear();
-            connection.read_line(&mut line).await?;
-            let size = usize::from_str_radix(line.trim().split(';').next().unwrap_or(""), 16)
-                .map_err(io::Error::other)?;
-            if size == 0 {
-                loop {
-                    line.clear();
-                    if connection.read_line(&mut line).await? == 0 || line == "\r\n" {
-                        break;
-                    }
-                }
+        let mut probe = [0u8; 1];
+        match idle.connection.get_ref().try_read(&mut probe) {
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                pooled = Some(idle.connection);
                 break;
             }
-            total += size;
-            if total > 65536 {
-                return Err(io::Error::other("oversized HTTP body"));
+            _ => {
+                pool.counters.closed.fetch_add(1, Ordering::Relaxed);
             }
-            let mut body = vec![0; size + 2];
-            connection.read_exact(&mut body).await?;
         }
-    } else if let Some(size) = length {
-        if size > 65536 {
-            return Err(io::Error::other("oversized HTTP body"));
-        }
-        let mut body = vec![0; size];
-        connection.read_exact(&mut body).await?;
-    } else if !matches!(status, 204 | 304) {
-        return Err(io::Error::other("HTTP response requires explicit framing"));
     }
+    let reused = pooled.is_some();
+    let mut connection = if let Some(connection) = pooled {
+        pool.counters.reused.fetch_add(1, Ordering::Relaxed);
+        connection
+    } else {
+        let stream = TcpStream::connect(address)
+            .await
+            .map_err(|e| ClientError::io("connect", e))?;
+        stream
+            .set_nodelay(true)
+            .map_err(|e| ClientError::io("connect", e))?;
+        pool.counters.created.fetch_add(1, Ordering::Relaxed);
+        BufReader::new(stream)
+    };
+    let result=async {
+        connection.write_all(format!("GET / HTTP/1.1\r\nHost: server\r\nx-bench-client: {identity}\r\nConnection: keep-alive\r\n\r\n").as_bytes()).await.map_err(|e|ClientError::io("write",e))?;
+        let mut line=String::new();
+        if connection.read_line(&mut line).await.map_err(|e|ClientError::io("read_status",e))?==0 {return Err(ClientError::protocol("read_status","eof"));}
+        if line.len()>8192 {return Err(ClientError::protocol("read_status","oversized"));}
+        let status=line.split_whitespace().nth(1).and_then(|v|v.parse::<u16>().ok()).filter(|s|(200..=599).contains(s)).ok_or_else(||ClientError::protocol("read_status","invalid_status"))?;
+        let (mut length,mut chunked,mut close)=(None,false,false);let mut headers=line.len();
+        loop {
+            line.clear();
+            if connection.read_line(&mut line).await.map_err(|e|ClientError::io("read_headers",e))?==0 {return Err(ClientError::protocol("read_headers","eof"));}
+            headers+=line.len();if headers>65536 {return Err(ClientError::protocol("read_headers","oversized"));}
+            if line=="\r\n" {break;}
+            if let Some((key,value))=line.split_once(':') {
+                match key.to_ascii_lowercase().as_str() {
+                    "content-length"=>length=Some(value.trim().parse::<usize>().map_err(|_|ClientError::protocol("framing","invalid_length"))?),
+                    "transfer-encoding"=>chunked=value.to_ascii_lowercase().contains("chunked"),
+                    "connection"=>close=value.to_ascii_lowercase().contains("close"), _=>{}
+                }
+            }
+        }
+        if chunked {
+            let mut total=0usize;
+            loop {
+                line.clear();
+                if connection.read_line(&mut line).await.map_err(|e|ClientError::io("read_body",e))?==0 {return Err(ClientError::protocol("read_body","eof"));}
+                let size=usize::from_str_radix(line.trim().split(';').next().unwrap_or(""),16).map_err(|_|ClientError::protocol("framing","invalid_chunk"))?;
+                if size==0 {
+                    loop {
+                        line.clear();
+                        if connection.read_line(&mut line).await.map_err(|e|ClientError::io("read_body",e))?==0 {return Err(ClientError::protocol("read_body","eof"));}
+                        headers+=line.len();if headers>65536 {return Err(ClientError::protocol("read_body","oversized_trailers"));}
+                        if line=="\r\n" {break;}
+                    }
+                    break;
+                }
+                total=total.checked_add(size).filter(|n|*n<=65536).ok_or_else(||ClientError::protocol("read_body","oversized"))?;
+                let mut body=vec![0;size+2];connection.read_exact(&mut body).await.map_err(|e|ClientError::io("read_body",e))?;
+                if body[size..]!=*b"\r\n" {return Err(ClientError::protocol("framing","invalid_chunk_terminator"));}
+            }
+        } else if let Some(size)=length {
+            if size>65536 {return Err(ClientError::protocol("read_body","oversized"));}
+            let mut body=vec![0;size];connection.read_exact(&mut body).await.map_err(|e|ClientError::io("read_body",e))?;
+        } else if !matches!(status,204|304) {return Err(ClientError::protocol("framing","missing_length"));}
+        Ok((status,close))
+    }.await;
+    let (status, close) = result.map_err(|mut error: ClientError| {
+        error.reused = reused;
+        error
+    })?;
     if !close {
-        pool.lock().await.push(connection);
+        pool.idle.lock().await.push_back(IdleConnection {
+            connection,
+            returned: Instant::now(),
+        });
     }
     Ok(status)
 }
+
 struct Observation {
     client: usize,
     status: u16,
     latency: u64,
     lag: u64,
     end: Instant,
+    error: Option<ClientError>,
 }
 struct Results {
     latency: Histogram,
@@ -163,6 +234,8 @@ struct Results {
     count: u64,
     latency_sum: u128,
     completed: u64,
+    error_categories: std::collections::BTreeMap<String, u64>,
+    error_examples: Vec<Value>,
 }
 impl Results {
     fn new(clients: usize) -> Self {
@@ -177,9 +250,11 @@ impl Results {
             count: 0,
             latency_sum: 0,
             completed: 0,
+            error_categories: Default::default(),
+            error_examples: Vec::new(),
         }
     }
-    fn add(&mut self, r: Observation, deadline: Instant) {
+    fn add(&mut self, r: Observation, deadline: Instant, start: Instant) {
         let index = match r.status {
             200 => 0,
             429 => 1,
@@ -187,6 +262,12 @@ impl Results {
             0 => 4,
             _ => 3,
         };
+        if let Some(error) = &r.error {
+            *self.error_categories.entry(error.key()).or_default() += 1;
+            if self.error_examples.len() < 16 {
+                self.error_examples.push(json!({"phase_ms":r.end.saturating_duration_since(start).as_millis(),"stage":error.stage,"kind":error.kind,"reused_connection":if error.stage=="request" {Value::Null} else {json!(error.reused)}}));
+            }
+        }
         self.statuses[index] += 1;
         self.latency.add(r.latency);
         self.lag.add(r.lag);
@@ -215,7 +296,7 @@ async fn phase(
 ) -> Value {
     let start = Instant::now();
     let deadline = start + Duration::from_secs(seconds);
-    let pool: Pool = Arc::new(Mutex::new(Vec::new()));
+    let pool: Pool = new_pool();
     let permits = Arc::new(Semaphore::new(concurrency));
     let active = Arc::new(AtomicUsize::new(0));
     let peak = Arc::new(AtomicUsize::new(0));
@@ -227,7 +308,7 @@ async fn phase(
         let due = start + Duration::from_secs_f64(i as f64 / rate as f64);
         sleep_until(due).await;
         while let Some(result) = tasks.try_join_next() {
-            results.add(result.expect("load worker panicked"), deadline);
+            results.add(result.expect("load worker panicked"), deadline, start);
         }
         if Instant::now().saturating_duration_since(due) > Duration::from_millis(100) {
             late += 1;
@@ -245,11 +326,16 @@ async fn phase(
             let begin = Instant::now();
             let current = active.fetch_add(1, Ordering::Relaxed) + 1;
             peak.fetch_max(current, Ordering::Relaxed);
-            let status = tokio::time::timeout(Duration::from_secs(3), exchange(pool, identity))
-                .await
-                .ok()
-                .and_then(Result::ok)
-                .unwrap_or(0);
+            let (status, error) = match tokio::time::timeout(
+                Duration::from_secs(3),
+                exchange(pool, identity),
+            )
+            .await
+            {
+                Ok(Ok(status)) => (status, None),
+                Ok(Err(error)) => (0, Some(error)),
+                Err(_) => (0, Some(ClientError::protocol("request", "timeout"))),
+            };
             let end = Instant::now();
             active.fetch_sub(1, Ordering::Relaxed);
             Observation {
@@ -258,22 +344,24 @@ async fn phase(
                 latency: (end - begin).as_micros() as u64,
                 lag: begin.saturating_duration_since(due).as_micros() as u64,
                 end,
+                error,
             }
         });
     }
     sleep_until(deadline).await;
     while let Some(result) = tasks.join_next().await {
-        results.add(result.expect("load worker panicked"), deadline);
+        results.add(result.expect("load worker panicked"), deadline, start);
     }
     let elapsed = (Instant::now() - start).as_secs_f64().max(seconds as f64);
     let divisor = elapsed.max(0.000001);
-    let mut r = json!({"schema_version":2,"generator":"rust-open-loop","histogram_precision":"upper bounds: 0.01ms to 100ms; 0.1ms to 1s; 1ms thereafter",
+    let mut r = json!({"schema_version":3,"generator":"rust-open-loop","histogram_precision":"upper bounds: 0.01ms to 100ms; 0.1ms to 1s; 1ms thereafter",
         "target_rps":rate,"offered_rps":if seconds>0 {results.count as f64/seconds as f64} else {0.0},"achieved_rps":results.count as f64/divisor,
         "elapsed_seconds":elapsed,"measurement_seconds":seconds,"drain_seconds":(elapsed-seconds as f64).max(0.0),"scheduled":scheduled,"sample_count":results.count,
         "completed_in_window":results.completed,"completion_rps_in_window":if seconds>0 {results.completed as f64/seconds as f64} else {0.0},
         "dropped":late+capacity,"dropped_late":late,"dropped_capacity":capacity,"loadgen_saturated":late+capacity>0,
         "concurrency_limit":concurrency,"peak_in_flight":peak.load(Ordering::Relaxed),"mean_in_flight":results.latency_sum as f64/1e6/divisor,
-        "http_200":results.statuses[0],"http_429":results.statuses[1],"http_503":results.statuses[2],"http_other":results.statuses[3],"errors":results.statuses[4],
+        "http_200":results.statuses[0],"http_429":results.statuses[1],"http_503":results.statuses[2],"http_other":results.statuses[3],"errors":results.statuses[4],"error_categories":results.error_categories,"error_examples":results.error_examples,"connection_pool":pool.json(),
+        "http_rps":(results.count-results.statuses[4]) as f64/divisor,"admitted_rps":results.statuses[0] as f64/divisor,
         "max_admissions_per_client":results.admitted.iter().max().unwrap_or(&0),"expected_admissions":results.attempts.iter().map(|n|(*n).min(limit)).sum::<usize>(),
         "clients_observed":results.attempts.iter().filter(|n|**n>0).count(),"dispatch_lag":results.lag.json(),"scheduled_latency":results.scheduled_latency.json(),
         "status_latency":{"200":results.status_latency[0].json(),"429":results.status_latency[1].json(),"503":results.status_latency[2].json()}});
@@ -319,7 +407,7 @@ async fn main() {
             && (1..=512).contains(&concurrency)
             && (1..=10000).contains(&clients)
     );
-    let pool = Arc::new(Mutex::new(Vec::new()));
+    let pool = new_pool();
     let mut ready = false;
     for _ in 0..100 {
         if matches!(
@@ -388,7 +476,7 @@ mod tests {
                 stream.write_all(reply.as_bytes()).await.unwrap();
             }
         });
-        let pool = Arc::new(Mutex::new(Vec::new()));
+        let pool = new_pool();
         assert_eq!(
             exchange_at(pool.clone(), "test".into(), &address)
                 .await
@@ -402,5 +490,116 @@ mod tests {
             429
         );
         task.await.unwrap();
+    }
+    async fn read_request(connection: &mut Connection) {
+        loop {
+            let mut line = String::new();
+            assert!(connection.read_line(&mut line).await.unwrap() > 0);
+            if line == "\r\n" {
+                break;
+            }
+        }
+    }
+    #[tokio::test]
+    async fn idle_connection_after_five_seconds_is_replaced_without_request_replay() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let task = tokio::spawn(async move {
+            for index in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = BufReader::new(stream);
+                read_request(&mut stream).await;
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .await
+                    .unwrap();
+                // Match the default server idle keep-alive lifetime.
+                if index == 0 {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+            }
+        });
+        let pool = new_pool();
+        assert_eq!(
+            exchange_at(pool.clone(), "first".into(), &address)
+                .await
+                .unwrap(),
+            200
+        );
+        tokio::time::sleep(Duration::from_millis(5100)).await;
+        assert_eq!(
+            exchange_at(pool.clone(), "second".into(), &address)
+                .await
+                .unwrap(),
+            200
+        );
+        task.await.unwrap();
+        assert_eq!(pool.counters.created.load(Ordering::Relaxed), 2);
+        assert_eq!(pool.counters.expired.load(Ordering::Relaxed), 1);
+    }
+    #[tokio::test]
+    async fn idle_remote_eof_is_discarded_before_new_request() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let task = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = BufReader::new(stream);
+                read_request(&mut stream).await;
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await
+                    .unwrap();
+            }
+        });
+        let pool = new_pool();
+        exchange_at(pool.clone(), "first".into(), &address)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        exchange_at(pool.clone(), "second".into(), &address)
+            .await
+            .unwrap();
+        task.await.unwrap();
+        assert_eq!(pool.counters.closed.load(Ordering::Relaxed), 1);
+    }
+    #[tokio::test]
+    async fn eof_after_request_write_is_classified_and_never_retried() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
+            read_request(&mut stream).await;
+        });
+        let pool = new_pool();
+        let error = exchange_at(pool.clone(), "uncertain-admission".into(), &address)
+            .await
+            .unwrap_err();
+        task.await.unwrap();
+        assert_eq!(error.key(), "read_status:eof");
+        assert_eq!(pool.counters.created.load(Ordering::Relaxed), 1);
+    }
+    #[test]
+    fn error_details_are_bounded_but_counts_are_complete() {
+        let start = Instant::now();
+        let mut results = Results::new(1);
+        for _ in 0..20 {
+            results.add(
+                Observation {
+                    client: 0,
+                    status: 0,
+                    latency: 1,
+                    lag: 0,
+                    end: start,
+                    error: Some(ClientError::protocol("read_status", "eof")),
+                },
+                start,
+                start,
+            );
+        }
+        assert_eq!(results.error_categories["read_status:eof"], 20);
+        assert_eq!(results.error_examples.len(), 16);
+        assert_eq!(results.statuses[4], 20);
     }
 }

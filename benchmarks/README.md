@@ -62,7 +62,7 @@ half the average scheduled requests per client. With 10,000 clients and sparse
 traffic, mixed may admit all observed requests; the report records actual counts.
 
 The generator maintains bounded concurrency and no unbounded request queue.
-Dropped scheduled arrivals mark saturation; offered RPS means attempted requests
+Dropped scheduled arrivals are recorded separately as in-flight-capacity or scheduler drops; offered RPS means attempted requests
 per scheduled duration, achieved RPS includes drain time, target RPS is separate.
 Latency starts when the request is actually sent; missed arrivals are reported
 rather than hidden in latency percentiles. Python's generator has a limited ceiling;
@@ -78,7 +78,8 @@ peak/process RSS (`/proc/1/status`), socket counters, Docker stats samples, OOM 
 without reviewing host paths and environment metadata.
 
 OOM, Redis OOM, unexpected statuses, request errors, quota mismatches, scheduler
-saturation, missing diagnostics and severe measured throttling invalidate a round.
+drops, missing diagnostics and severe measured throttling invalidate measurement quality.
+Schema-3 in-flight-capacity drops retain clean overload observations but fail the load level.
 Throttling threshold is currently 100 ms per measured second. Inspect raw counters
 because startup/warmup also contribute to resource samples. Invalid raw results
 remain visible; never treat invalid rows as ranked winners.
@@ -108,7 +109,7 @@ Completion RPS uses at least the entire scheduled interval, plus any drain time.
 It cannot exceed offered RPS due to the final pacing gap. Reports also record
 completed-in-window counts, actual peak/mean in-flight requests, dispatch lag,
 latency including dispatch lag, and separate 200/429/503 latency distributions.
-Dropped arrivals remain explicit and invalidate the run. Concurrency is a ceiling,
+Dropped arrivals remain explicit: scheduler drops invalidate measurement; capacity drops fail the load level without erasing overload observations. Concurrency is a ceiling,
 not a claim that all slots were occupied. Loadgen CPU/throttling deltas are recorded
 around measurement; server resource samples still include startup/warmup overhead.
 
@@ -172,7 +173,7 @@ SLO. Generator saturation invalidates server capacity comparisons. Confirm any
 candidate boundary using longer repeated runs. The Python generator may hit its
 own CPU limit first; increasing offered rate cannot resolve that ambiguity.
 
-The benchmark workflow runs **only by manual dispatch**, selecting **pk or smoke**, never explore. Pushes and pull requests do not trigger it.
+The benchmark workflow runs **only by manual dispatch**, selecting **compare or smoke**, never explore. Pushes and pull requests do not trigger it.
 CI explicitly uses server=1 CPU, loadgen=0.5 CPU, Redis=0.5 CPU, one HTTP worker;
 memory/swap limits are unchanged. On 2-CPU runners the generator and Redis share
 CPU 0, and the server uses CPU 1. On >=3-CPU runners sets are disjoint. This sharing
@@ -205,48 +206,49 @@ Runner architecture, quotas and platform identifiers must match before comparing
 runs; local Apple Silicon results cannot rank against shared x64 Runner numbers.
 
 
-## High-load competitor PK (manual only)
+## High-load comparative benchmarks (manual only)
 
-Select **Actions → Benchmark PK → Run workflow → suite: pk**. This is the default
+Select **Actions → High-load Benchmarks → Run workflow → suite: compare**. This is the default
 manual suite. Pushes and pull requests never trigger this workflow. The obsolete
 low-load behavior suite has been removed. Optional `smoke` is only an operational
 check, not the competitor comparison result.
 
-PK compares baseline, HEAD, governor, trypema and extensible sequentially using the
+high-load comparison compares baseline, HEAD, governor, trypema and extensible sequentially using the
 same Actix 4.18.1 stack and request workload. Defaults: 10k/30k/60k offered RPS,
 128 concurrency ceiling, one client, all-allow, 5 s warmup + 20 s measurement,
 five repetitions in alternating order, Memory and Redis. Unsupported backend cells
 are skipped by the published capability registry. Plan: 135 cells, 3375 seconds
 of load, plus compilation/startup/cleanup; the manual job timeout is 120 minutes.
 
-PK requires **four native Docker CPUs**: native Rust loadgen=2 CPUs (sets 0,1),
+high-load comparison requires **four native Docker CPUs**: native Rust loadgen=2 CPUs (sets 0,1),
 server=1 CPU (set 2, one worker), Redis=1 CPU (set 3). Memory/swap limits remain
 512 MiB/1 GiB/512 MiB. It refuses smaller/shared layouts, including CI smoke's
 0.5-CPU generator. Docker Desktop global configuration is unchanged. Existing Safe
-resources and rate bounds remain unchanged. The explicit PK hard ceilings are
+resources and rate bounds remain unchanged. The explicit high-load comparison hard ceilings are
 100k RPS, 512 concurrency, 60 s measurement, 15 s warmup, five repeats.
 
 ```sh
-python3 benchmarks/bench.py pk --plan
-python3 benchmarks/bench.py pk
+python3 benchmarks/bench.py compare --plan
+python3 benchmarks/bench.py compare
 # A narrower, repeated Memory comparison:
-python3 benchmarks/bench.py pk --backends memory --variants baseline head governor trypema extensible --rates 10000 30000 60000 --plan
+python3 benchmarks/bench.py compare --backends memory --variants baseline head governor trypema extensible --rates 10000 30000 60000 --plan
 ```
 
 The Rust/Tokio generator uses pooled HTTP/1.1 connections, bounded in-flight tasks,
 fixed-size latency histograms, and explicit dropped-arrival/error accounting. Its
 locked dependencies are copied into the run artifacts. Histograms round upward:
 0.01 ms bins through 100 ms, 0.1 ms through 1 s, then 1 ms. The Python generator
-remains for smoke/Safe/explore compatibility; it is not used by PK. Native image
+remains for smoke/Safe/explore compatibility; it is not used by high-load comparison. Native image
 architecture is verified along with server images. No x86 emulation is requested.
 
-Fixed resource throttling is normal when pushing a capped server: PK records
+Fixed resource throttling is normal when pushing a capped server: high-load comparison records
 `quota_throttled` and raw cgroup counters without invalidating a round solely for
-SUT quota throttling. OOM, Redis OOM, malformed responses, dropped arrivals,
-transport failures and asserted quota violations still invalidate comparisons.
+SUT quota throttling. OOM, Redis OOM, malformed responses, scheduler drops,
+transport failures and asserted quota violations still invalidate measurement quality.
+Schema-3 capacity-only drops fail load qualification and are excluded from matched cost ratios; they do not invalidate measurement quality.
 Generator pressure prevents attributing an observed ceiling to the server.
 
-The assessment's **High-load PK qualification** table requires five valid repeats,
+The assessment's **High-load benchmark qualification** table requires five valid repeats,
 >=99% completion of offered rate, scheduled p99 <=10 ms, and generator CPU below
 85% of its quota. It reports the highest *qualified tested level*, not an unbounded
 maximum. The 10 ms budget is a stated comparison criterion, not a universal SLO.
@@ -258,3 +260,69 @@ labels and nominal over-admission remain visible. Different policies may be
 compared as end-to-end products but do not become equivalent algorithms. A winner
 is not manufactured from differing accepted-request counts or generator overload.
 Old Actix 4.11 results must be rebaselined after the common HTTP stack update.
+
+
+## Connection reliability and schema 3
+
+Every benchmark server now uses the same explicit **120-second Keep-Alive**.
+The native pool uses FIFO reuse, a **4-second idle limit**, and a nonblocking
+idle-socket check before sending. Retired idle sockets are counted separately
+from request errors. A peer can still close after the check: any error after
+sending remains a real failed attempt, **without automatic replay**. This avoids
+double quota consumption and prevents retries from hiding errors.
+
+Raw data now include `error_categories` (connect/write/status/headers/body/framing/
+timeout), up to 16 error examples with phase-relative timestamps and reuse context,
+and pool creation/reuse/idle-retirement counters. Timeout reuse context is unknown
+and serialized as null. Counts remain complete even after the example limit.
+
+Execution status, measurement quality and load qualification are separate. A
+capacity-only drop is a clean overload observation, not proof that generator CPU
+is saturated. Such rounds remain in diagnostic tables but do not qualify that
+rate or enter matched-workload cost ratios. Scheduler loss, HTTP/transport errors,
+OOM and incorrect counters still invalidate measurements. Schema-2 legacy data
+retain their original strict interpretation and missing error details are explicit.
+
+`http_rps` counts completed HTTP responses; `admitted_rps` counts HTTP 200. Legacy
+`achieved_rps` remains completed attempts including errors for compatibility; the
+assessment displays these separately and qualifies rates using HTTP completion.
+Schema-3 accounting checks run even when transport errors are present.
+
+high-load comparison stops after persisting diagnostics if a baseline measurement is invalid. It
+does not stop merely because the baseline hit the in-flight bound. To validate
+the client lifecycle before a full matrix, run a narrow high-rate calibration:
+
+```sh
+python3 benchmarks/bench.py compare --variants baseline --rates 10000 --duration 20 --warmup 5 --repeats 3 --plan
+# Remove --plan to execute. Review error categories/pool counters before full high-load comparison.
+```
+
+Regression tests cover a remote five-second idle close, earlier idle EOF,
+post-write EOF without replay, chunked framing and bounded error examples.
+This addresses a source-identified failure mode; a clean local run does not prove
+that every error from a previous GitHub run had the same cause.
+
+
+## Interpreting the connection regression
+
+The four 20-second, 10k RPS baseline/HEAD Memory/Redis cells validate the revised
+client lifecycle, not a competitor ranking: zero transport/scheduler errors were
+observed locally. Two cells still reached the in-flight bound; one repeat cannot
+establish a sustainable rate or equivalence. Archived artifacts retain their old
+profile labels; new CLI and workflow runs use `compare` and resource `comparison`.
+
+Before a full repeated comparison, distinguish reserved request slots from active
+HTTP exchanges: the driver acquires a semaphore permit before spawning a task,
+while `peak_in_flight` counts only started tasks. Capacity drops with peak below
+128 therefore can reflect executor backlog, not 128 simultaneous network requests.
+The next diagnostic additions should record reserved/queued peaks, executor wait
+and submission burst sizes. Normalize pacing before interpreting rare capacity
+drops as a server limit. Do not loosen the qualification threshold simply to
+produce a winner.
+
+Then calibrate baseline on the same runner for >=20 seconds, sweep 128/512 slot
+bounds, and locate the Redis boundary with finer 10k/15k/20k/25k rates. Confirm
+candidate levels with >=5 repetitions and phase-aligned resource samples. Memory
+and Redis need independent rate ladders; the same coarse levels need not bracket
+both boundaries. A clean committed source tree and matched environment are required
+for formal comparative conclusions.

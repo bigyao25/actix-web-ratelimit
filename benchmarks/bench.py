@@ -36,15 +36,15 @@ def counters(raw):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('profile', nargs='?', default='safe', choices=['safe','smoke','explore','pk'])
-    p.add_argument('--resources', choices=['safe','ci','pk'], default=None)
+    p.add_argument('profile', nargs='?', default='safe', choices=['safe','smoke','explore','compare'])
+    p.add_argument('--resources', choices=['safe','ci','comparison'], default=None)
     p.add_argument('--variants', nargs='+', choices=VARIANTS, default=None)
     p.add_argument('--backends', nargs='+', choices=['memory','redis'], default=['memory','redis'])
     p.add_argument('--clients', nargs='+', type=int, default=None)
     p.add_argument('--concurrency', nargs='+', type=int, default=None)
     p.add_argument('--modes', nargs='+', choices=['allow','deny','mixed'], default=None)
     p.add_argument('--rate', type=int, default=None)
-    p.add_argument('--rates', nargs='+', type=int, help='Sequential rates: safe <=2000, explore <=10000, PK <=100000')
+    p.add_argument('--rates', nargs='+', type=int, help='Sequential rates: safe <=2000, explore <=10000, high-load comparison <=100000')
     p.add_argument('--plan', action='store_true', help='Print matrix size and load duration without Docker or builds')
     p.add_argument('--duration', type=int, default=None)
     p.add_argument('--warmup', type=int, default=None)
@@ -54,9 +54,9 @@ def main():
     p.add_argument('--output', type=Path, default=HERE/'results'/time.strftime('%Y%m%d-%H%M%S'))
     a = p.parse_args()
     explore=a.profile=='explore'
-    pk=a.profile=='pk'
-    a.resources=a.resources or ('pk' if pk else 'safe')
-    if pk:
+    compare=a.profile=='compare'
+    a.resources=a.resources or ('comparison' if compare else 'safe')
+    if compare:
         a.variants=a.variants or ['baseline','head','governor','trypema','extensible']
         a.clients=a.clients or [1]
         a.concurrency=a.concurrency or [128]
@@ -66,8 +66,8 @@ def main():
         a.repeats=a.repeats if a.repeats is not None else 5
         if a.rates is None and a.rate is None:
             a.rates=[10000,30000,60000]
-    if pk != (a.resources=='pk'):
-        p.error('PK runs require --resources pk; this layout is exclusive to PK')
+    if compare != (a.resources=='comparison'):
+        p.error('high-load comparison runs require --resources comparison; this layout is exclusive to high-load comparison')
     a.variants=a.variants or (['baseline','head'] if explore else ['baseline','v0.1.2','v0.2.1','head'])
     a.clients=a.clients or ([1] if explore else [1,100,10000])
     a.concurrency=a.concurrency or ([128] if explore else [32,128,512])
@@ -86,12 +86,12 @@ def main():
     rates=a.rates or [a.rate]
     if a.profile=='smoke':
         rates=[min(rate,500) for rate in rates]
-    max_rate=100000 if pk else 10000 if explore else 2000
+    max_rate=100000 if compare else 10000 if explore else 2000
     rates=list(dict.fromkeys(rates))
     if any(not 1<=rate<=max_rate for rate in rates):
         p.error(f'Every rate step must be 1..{max_rate} RPS')
-    if pk and (a.duration>60 or a.warmup>15 or a.repeats>5):
-        p.error('PK bounds: duration <=60, warmup <=15, repeats <=5')
+    if compare and (a.duration>60 or a.warmup>15 or a.repeats>5):
+        p.error('high-load comparison bounds: duration <=60, warmup <=15, repeats <=5')
     if explore and (a.duration>30 or a.warmup>10 or a.repeats>3):
         p.error('Explore bounds: duration <=30, warmup <=10, repeats <=3')
     if not (1<=a.rate<=max_rate and 1<=a.duration<=120 and 0<=a.warmup<=30 and 1<=a.repeats<=10):
@@ -129,8 +129,8 @@ def main():
     sets=[cpus(os.environ.get(k,resource[v])) for k,v in [('LOADGEN_CPUSET','loadgen_cpuset'),('SERVER_CPUSET','server_cpuset'),('REDIS_CPUSET','redis_cpuset')]]
     if any(not x or min(x)<0 or max(x)>=info['NCPU'] for x in sets):
         p.error('Invalid CPU set')
-    if a.resources in ('safe','pk') and ([len(x) for x in sets]!=([2,1,1] if pk else [1,2,1]) or any(x&y for x,y in itertools.combinations(sets,2))):
-        p.error('CPU sets require disjoint 2/1/1 CPUs for PK or 1/2/1 for Safe')
+    if a.resources in ('safe','comparison') and ([len(x) for x in sets]!=([2,1,1] if compare else [1,2,1]) or any(x&y for x,y in itertools.combinations(sets,2))):
+        p.error('CPU sets require disjoint 2/1/1 CPUs for high-load comparison or 1/2/1 for Safe')
     for key, selected in zip(('loadgen_cpuset','server_cpuset','redis_cpuset'),sets):
         resource[key]=','.join(map(str,sorted(selected)))
     resource['effective_cpusets']=[sorted(x) for x in sets]
@@ -145,7 +145,7 @@ def main():
         print('Warning: other running containers may interfere; recorded in environment.json',flush=True)
     metadata=dict(git_sha=run('git','rev-parse','HEAD',cwd=ROOT),dirty=dirty,
                   platform=platform.platform(),docker=info,profile=vars(a)|{'output':str(a.output)},
-                  resource_layout=resource, other_running_containers=outsiders, rust='1.98.0', build='release --locked',competitors='governor 0.10.0; trypema 0.1.2/core 2.2.1; extensible 0.4.0; Actix 4.18.1')
+                  resource_layout=resource, other_running_containers=outsiders, rust='1.98.0', build='release --locked', http_keep_alive_seconds=120,competitors='governor 0.10.0; trypema 0.1.2/core 2.2.1; extensible 0.4.0; Actix 4.18.1')
     metadata['release_tag_commits']={v:run('git','rev-parse',v+'^{commit}',cwd=ROOT) for v in a.variants if v.startswith('v') and subprocess.run(['git','rev-parse','--verify',v+'^{commit}'],cwd=ROOT,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL).returncode==0}
     metadata['source_hashes']={name:hashlib.sha256((ROOT/name).read_bytes()).hexdigest() for name in run('git','ls-files','--cached','--others','--exclude-standard',cwd=ROOT).splitlines() if (ROOT/name).is_file()}
     (a.output/'environment.json').write_text(json.dumps(metadata,indent=2))
@@ -158,10 +158,10 @@ def main():
         (a.output/(v+'.Cargo.lock')).write_bytes(lockfile.read_bytes())
         if not a.skip_build:
             subprocess.run(['docker','build','-f',str(HERE/'docker/server.Dockerfile'),'--build-arg','VARIANT='+v,'-t','ratelimit-bench-'+v+':local',str(ROOT)],check=True)
-    if pk:
+    if compare:
         (a.output/'loadgen.Cargo.lock').write_bytes((HERE/'native-loadgen/Cargo.lock').read_bytes())
-    generator_image='ratelimit-bench-loadgen-native:local' if pk else 'ratelimit-bench-loadgen:local'
-    generator_dockerfile='native-loadgen.Dockerfile' if pk else 'loadgen.Dockerfile'
+    generator_image='ratelimit-bench-loadgen-native:local' if compare else 'ratelimit-bench-loadgen:local'
+    generator_dockerfile='native-loadgen.Dockerfile' if compare else 'loadgen.Dockerfile'
     if not a.skip_build:
         subprocess.run(['docker','build','-f',str(HERE/'docker'/generator_dockerfile),'-t',generator_image,str(ROOT)],check=True)
     images={v:json.loads(docker('image','inspect','ratelimit-bench-'+v+':local'))[0] for v in a.variants}
@@ -247,7 +247,7 @@ def main():
                                       resource_profile=a.resources, server_cpu_limit=resource['server_cpus'],
                                       platform_id=platform_id,variant=v,scenario=f'{backend}/{clients}/{concurrency}/{mode}/{rate}rps',repeat=repeat,
                                       oom=any(x['State']['OOMKilled'] for x in states.values()) or any(counters(raw).get('oom',0)>0 for raw in after.values()) or counters(result['loadgen_cgroup']['memory.events']).get('oom',0)>0,redis_oom=int(rc.get('errorstat_OOM','count=0').split('=')[-1])>0,
-                                      cpu_throttled=throttled and not pk, quota_throttled=throttled,
+                                      cpu_throttled=throttled and not compare, quota_throttled=throttled,
                                       loadgen_peak_bytes=int(result['loadgen_cgroup']['memory.peak']),
                                       server_cpu_pct=cpu['server']['usage_usec']/diagnostic_seconds/10000,
                                       server_rss_bytes=int(after['server'].split('VmRSS:')[1].split()[0])*1024,
@@ -256,9 +256,9 @@ def main():
                                       memory_peak_bytes=int(after['server'].split('MEMORY\n')[1].splitlines()[1]),
                                       quota_exceeded=variants.VARIANTS[v]['oracle'] and result['max_admissions_per_client']>limit,
                                       observed_nominal_excess=max(0,result['max_admissions_per_client']-limit),
-                                      http_version='4.18.1',resource_layout_id=hashlib.sha256(json.dumps(resource,sort_keys=True).encode()).hexdigest()[:12],
+                                      http_version='4.18.1',http_keep_alive_seconds=120,resource_layout_id=hashlib.sha256(json.dumps(resource,sort_keys=True).encode()).hexdigest()[:12],
                                       quota=limit,window_seconds=duration+a.warmup+60,
-                                      algorithm=variants.VARIANTS[v]['algorithm'], workload='pk' if pk else 'cost',
+                                      algorithm=variants.VARIANTS[v]['algorithm'], workload='comparison' if compare else 'cost',
                                       equivalence_group='exact-log' if v in ('head','v0.2.1') else v,
                                       correctness='first-window burst oracle' if variants.VARIANTS[v]['oracle'] else 'non-equivalent policy; observations only',
                                       diagnostics=dict(before=before,after=after,cpu=cpu,samples=samples,redis=rc,containers=states))
@@ -275,6 +275,9 @@ def main():
                     summary=report.summarize({'rounds':rounds})
                     (a.output/'validated.json').write_text(json.dumps(summary,indent=2))
                     (a.output/'report.md').write_text(f"Git SHA: {metadata['git_sha']}\n\nDirty/non-reproducible: {bool(dirty)}\n\n"+report.markdown(summary))
+                    if report.invalid_comparison_baseline(result):
+                        (a.output/'assessment.md').write_text(assessment.render(a.output,'measurement_failure'))
+                        raise RuntimeError('Baseline measurement invalid; stopped high-load comparison before wasting further rounds. Inspect transport/scheduler diagnostics.')
     finally:
         cleanup()
     (a.output/'assessment.md').write_text(assessment.render(a.output,'completed'))

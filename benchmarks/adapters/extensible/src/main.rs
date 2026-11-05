@@ -31,7 +31,7 @@ async fn main() -> std::io::Result<()> {
                     .default_service(web::to(|| async { HttpResponse::Ok().body("ok") }))
             })
             .workers(workers)
-            .bind(("0.0.0.0", 8080))?
+            .keep_alive(std::time::Duration::from_secs(120)).bind(("0.0.0.0", 8080))?
             .run()
             .await
         }};

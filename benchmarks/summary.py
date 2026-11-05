@@ -24,7 +24,11 @@ def assess(round_):
     generator_pressure=round_.get('loadgen_cpu_pct',0)>=85*round_.get('loadgen_cpu_limit',1)
     if generator_pressure and (round_.get('loadgen_saturated') or round_.get('dispatch_lag',{}).get('p99_ms',0)>10):
         return 'loadgen pressure; server capacity unresolved'
-    if reasons and round_.get('dropped_capacity',0)>0 and not generator_pressure:
+    if round_.get('dropped_late',0)>0:
+        return 'measurement invalid: scheduler missed arrivals'
+    if round_.get('errors',0)>0:
+        return 'measurement invalid: transport/protocol errors; inspect categories'
+    if round_.get('dropped_capacity',0)>0 and not generator_pressure:
         return 'in-flight cap reached; inspect SUT/transport; rate not sustained'
     if reasons:
         return 'invalid; capacity unresolved'
@@ -40,14 +44,17 @@ def render(folder, status='unknown', artifact_url=''):
     env_path=folder/'environment.json'
     env=json.loads(env_path.read_text()) if env_path.exists() else {}
     rows=json.loads(raw_path.read_text()).get('rounds',[]) if raw_path.exists() else []
-    rows=[{**r,'invalid_reasons':report.validate(r)} for r in rows]
+    rows=[{**r,'invalid_reasons':report.validate(r),'load_failure_reasons':report.load_failures(r)} for r in rows]
     valid=[r for r in rows if not r['invalid_reasons']]
     expected=[r for r in rows if expected_historical(r)]
     unexpected=[r for r in rows if r['invalid_reasons'] and not expected_historical(r)]
+    load_failed=[r for r in valid if r['load_failure_reasons']]
     esc=lambda v: str(v).replace('|','\\|').replace('\n',' ').replace('`','').replace('<','&lt;')
     fmt=lambda v: 'N/A' if v is None else f'{v:.2f}'
     lines=['# Benchmark assessment','',f'Execution status: **{esc(status)}**.',
-           f'Completed rounds: **{len(rows)}**; valid: **{len(valid)}**; expected historical defects: **{len(expected)}**; other invalid: **{len(unexpected)}**.','']
+           f'Completed rounds: **{len(rows)}**; measurement-clean: **{len(valid)}**; expected historical defects: **{len(expected)}**; other invalid: **{len(unexpected)}**.','']
+    quality='no data' if not rows else 'failed' if not valid else 'partial' if unexpected else 'clean'
+    lines += [f'Measurement quality: **{quality}**. Clean rounds failing load criteria: **{len(load_failed)}**. Execution success alone does not qualify a workload.','']
     if not rows:
         lines += ['**No benchmark data collected.** Check build/preflight logs. No performance conclusion is available.','']
     else:
@@ -60,22 +67,22 @@ def render(folder, status='unknown', artifact_url=''):
             lines += ['**CI smoke: operational/correctness validation only.** Short single rounds cannot establish a performance regression or capacity limit.','']
     if env:
         profile=env.get('profile',{})
-        lines += [f"Git: `{esc(env.get('git_sha','unknown'))}`; dirty: **{bool(env.get('dirty'))}**; profile: `{esc(profile.get('profile'))}`; resources: `{esc(profile.get('resources','safe'))}`.",
+        lines += [f"Git: `{esc(env.get('git_sha','unknown'))}`; dirty: **{bool(env.get('dirty'))}**; profile: `{esc('compare' if profile.get('profile')=='pk' else profile.get('profile'))}`; resources: `{esc('comparison' if profile.get('resources')=='pk' else profile.get('resources','safe'))}`.",
                   f"Resource layout: `{esc(json.dumps(env.get('resource_layout',{}),sort_keys=True))}`.",'']
         if env.get('resource_layout',{}).get('shared_cpuset'):
             lines += ['CI shares CPU sets explicitly; these measurements are not comparable to the disjoint local Safe layout.','']
     if rows:
         lines += ['## Observations','',
-                  '| Variant / scenario | Target / completed RPS | 200 / 429 / errors | p99 ms | Peak / mean in flight | Assessment |',
-                  '| --- | ---: | ---: | ---: | ---: | --- |']
+                  '| Variant / scenario | Target / HTTP / attempts RPS | 200 / 429 / errors | Capacity / scheduler drops | Sent / scheduled p99 ms | Peak / mean in flight | Assessment |',
+                  '| --- | ---: | ---: | ---: | ---: | ---: | --- |']
         for r in rows[:80]:
             error=sum(r.get(k,0) for k in ('http_503','http_other','errors'))
-            lines.append(f"| {esc(r.get('variant'))} / {esc(r.get('scenario'))} | {fmt(r.get('target_rps'))} / {fmt(r.get('achieved_rps'))} | {r.get('http_200','N/A')} / {r.get('http_429','N/A')} / {error} | {fmt(r.get('p99_ms'))} | {r.get('peak_in_flight','N/A')} / {fmt(r.get('mean_in_flight'))} | {esc(assess(r))} |")
+            lines.append(f"| {esc(r.get('variant'))} / {esc(r.get('scenario'))} | {fmt(r.get('target_rps'))} / {fmt(r.get('http_rps'))} / {fmt(r.get('achieved_rps'))} | {r.get('http_200','N/A')} / {r.get('http_429','N/A')} / {error} | {r.get('dropped_capacity','N/A')} / {r.get('dropped_late','N/A')} | {fmt(r.get('p99_ms'))} / {fmt(r.get('scheduled_latency',{}).get('p99_ms'))} | {r.get('peak_in_flight','N/A')} / {fmt(r.get('mean_in_flight'))} | {esc(assess(r))} |")
         if len(rows)>80:
             lines += ['', 'Table truncated; the artifact contains every round.']
         levels=collections.defaultdict(list)
         for r in valid:
-            if r.get('variant') not in ('governor','trypema','extensible') and r.get('workload')!='behavior':
+            if r.get('variant') not in ('governor','trypema','extensible') and not r['load_failure_reasons']:
                 levels[(r.get('variant'),r.get('scenario','').split('/')[0])].append(r.get('target_rps',0))
         if levels:
             lines += ['','## Highest valid offered rates','']
@@ -85,26 +92,31 @@ def render(folder, status='unknown', artifact_url=''):
         for r in rows:
             if r['invalid_reasons']:
                 lines += ['- '+esc(r.get('variant'))+' / '+esc(r.get('scenario'))+': '+esc(', '.join(r['invalid_reasons']))]
-        if any('loadgen pressure' in assess(r) for r in rows):
+        if any(r.get('variant')=='baseline' and r.get('errors',0)>0 for r in rows):
+            lines += ['- Baseline also has transport errors: investigate shared client/pool/transport before attributing failures to limiters. Inspect categories and bounded error timestamps; do not hide failures by retrying.']
+        elif any(r.get('dropped_capacity',0)>0 for r in rows):
+            lines += ['- In-flight bounds were reached: these are overload observations, not proof of generator CPU saturation. Compare concurrency bounds and server/Redis CPU; do not blindly increase offered rate.']
+        elif any('loadgen pressure' in assess(r) for r in rows):
             lines += ['- Increase generator efficiency before increasing offered rate; generator pressure prevents attributing the limit to the server.']
         elif env.get('profile',{}).get('profile')=='explore':
             lines += ['- No boundary was demonstrated within this probe range. Confirm the highest level with longer repeats before considering any new resource/rate ceiling; the maximum remains unknown.']
         else:
             lines += ['- If no pressure was demonstrated, use a bounded local `explore` sweep; a higher rate alone does not prove saturation.']
         lines += ['- Confirm any candidate boundary with longer repeated runs, identical quotas/resources and latency/error criteria. Short-run p99 values remain descriptive.']
-    if env.get('profile',{}).get('profile')=='pk':
+    if env.get('profile',{}).get('profile') in ('compare','pk'):
         groups=collections.defaultdict(list)
         for r in rows:
             groups[(r.get('variant'),r.get('scenario'))].append(r)
         qualified=collections.defaultdict(list)
-        lines += ['', '## High-load PK qualification','',
+        lines += ['', '## High-load benchmark qualification','',
                   'Same offered rates, workers, quotas and resource layout. A level qualifies only with at least five valid repeats, completion >=99% of offered load, scheduled p99 <=10ms, and loadgen CPU below 85% of its quota. Higher offered rate alone is not proof of server pressure.',
-                  'SUT cgroup throttling is expected enforcement of the fixed CPU budget in PK and is recorded, not treated as environmental corruption. OOM, transport errors and dropped arrivals remain invalid.','',
+                  'SUT cgroup throttling is expected enforcement of the fixed CPU budget in high-load comparison and is recorded, not treated as environmental corruption. OOM, transport errors and dropped arrivals remain invalid.','',
                   '| Variant / scenario | Repeats | Qualified at this rate | Reason |', '| --- | ---: | --- | --- |']
         for (variant,scenario),items in sorted(groups.items()):
             checks=[(len(items)>=5,'fewer than five repeats'),
-                    (all(not r['invalid_reasons'] for r in items),'invalid round'),
-                    (all(r.get('achieved_rps',0)>=.99*r.get('target_rps',1) for r in items),'completion below 99%'),
+                    (all(not r['invalid_reasons'] for r in items),'measurement invalid'),
+                    (all(r.get('dropped_capacity',0)==0 for r in items),'in-flight limit reached'),
+                    (all(r.get('http_rps',r.get('achieved_rps',0))>=.99*r.get('target_rps',1) for r in items),'completion below 99%'),
                     (all((r.get('scheduled_latency',{}).get('p99_ms') or float('inf'))<=10 for r in items),'scheduled p99 above 10ms'),
                     (all(r.get('loadgen_cpu_pct',float('inf'))<85*r.get('loadgen_cpu_limit',1) for r in items),'loadgen CPU pressure')]
             passed=all(ok for ok,_ in checks)
@@ -113,7 +125,7 @@ def render(folder, status='unknown', artifact_url=''):
         lines += ['', 'Highest qualified tested level (not an unbounded maximum):','']
         for (variant,backend,condition),rates in sorted(qualified.items(),key=lambda item:(item[0][1],item[0][2],-max(item[1]))):
             lines.append('- '+esc(str(variant)+' / '+backend+' / '+condition)+': '+str(max(rates))+' RPS; policy guarantees remain different.')
-    contrasts=comparison.contrasts(valid)
+    contrasts=comparison.contrasts([r for r in valid if not r['load_failure_reasons']])
     if contrasts:
         lines += ['', '## Competitor cost at matched workloads','',
                   'Ratios are competitor / HEAD medians at identical recorded quotas/resources. Different algorithms provide different guarantees: these observations do not rank implementation efficiency. CPU spans warmup; RSS and Redis memory are snapshots, not normalized state-size estimates.',
@@ -122,6 +134,14 @@ def render(folder, status='unknown', artifact_url=''):
                   '| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |']
         for c in contrasts:
             lines.append('| '+esc(c['variant']+' / '+c['scenario'])+' | '+esc(c['algorithm'])+' | '+str(c['repeats'])+' | '+' | '.join(fmt(c[key]) for key in ('p99_ratio','cpu_ratio','rss_ratio','redis_ratio'))+' | '+esc(c['evidence'])+' |')
+    if rows:
+        lines += ['', '## Transport and connection diagnostics','',
+                  '| Variant / scenario | Error categories | First error phase ms | New / reused / idle expired / idle discarded |',
+                  '| --- | --- | ---: | ---: |']
+        for r in rows[:80]:
+            pool=r.get('connection_pool',{})
+            first=r.get('error_examples',[])
+            lines.append('| '+esc(str(r.get('variant'))+' / '+str(r.get('scenario')))+' | '+esc(json.dumps(r.get('error_categories',{'legacy':'unknown'}),sort_keys=True))+' | '+str(first[0].get('phase_ms') if first else 'N/A')+' | '+' / '.join(str(pool.get(k,'N/A')) for k in ('created','reused','idle_expired','idle_unusable'))+' |')
     lines += ['', '## Files','', '`report.md`: full tables; `raw.json`: all rounds; `validated.json`: exclusions/statistics; `environment.json`: platform/limits/images; `run.log`: build and execution log.']
     if artifact_url:
         lines += ['', f'[Download benchmark diagnostics artifact]({artifact_url})']
