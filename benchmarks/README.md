@@ -17,7 +17,7 @@ image IDs and architecture are recorded. Do not use it for a formal source compa
 
 Safe defaults: 15 s warmup, 60 s measurement, 5 repetitions, 1,000 target RPS.
 Options: `--clients 1 100 10000`, `--concurrency 32 128 512`,
-`--modes allow deny mixed`, `--duration`, `--warmup`, `--repeats`, `--rate`, `--output`.
+`--modes allow deny mixed reject`, `--duration`, `--warmup`, `--repeats`, `--rate`, `--output`.
 Safe rejects >2,000 RPS, >120 s measurements, >30 s warmup and >10 repeats.
 Smoke uses 1 s warmup, 2 s measurement, one repeat, up to 500 RPS, one client, concurrency 32.
 A full default matrix is deliberately long. Start with smoke and a selected matrix.
@@ -99,9 +99,12 @@ measurement. Never regenerate locks in Docker builds (`--locked` is mandatory).
 See [competitors.md](competitors.md) for verified competitor versions and exclusions.
 New algorithms need separate semantics and correctness oracles.
 
-CI only runs short smoke/build verification, never the full matrix or a regression
-gate. Current limitations: no full rolling-window oracle, no remotely induced Redis
-fault suite, no host thermal telemetry, no confidence intervals, and no multi-worker race oracle for bucketed competitor admission. BuildKit resource usage is not capped by Compose runtime limits.
+The benchmark workflow runs only on manual dispatch; normal CI does not schedule
+long measurements or a regression gate. Current limitations: no full rolling-window
+oracle, no remotely induced Redis fault suite, no host thermal telemetry, no
+simultaneous confidence guarantees across comparisons, and no multi-worker race
+oracle for bucketed competitor admission. BuildKit resource usage is not capped
+by Compose runtime limits.
 
 ## Timing and load diagnostics (schema 2)
 
@@ -417,27 +420,82 @@ See the [Actions matrix documentation](https://docs.github.com/en/actions/how-to
 Each backend follows this bounded campaign **on the same runner throughout**:
 
 1. Probe all supported products with 2-second warmup, 5-second measurement and
-   one repeat. Memory uses 15k/30k/45k/60k; Redis uses 10k/15k/20k/25k/30k RPS.
+   one repeat. Start with Memory 45k/60k or Redis 10k/16k RPS, then refine the
+   observed pass/fail bracket. Midpoints are quantized to 500 RPS; stop when the
+   gap is <=5k for Memory or <=2k for Redis. Up to three additional short rates
+   are allowed, prioritizing HEAD, then other peers. Missing lower/upper endpoints
+   can trigger a bounded range extension; invalid or generator-limited rows never
+   become capacity-failure evidence. `--resolution` and `--refine-budget` are bounded
+   CLI overrides. This is adaptive selection, not a fixed four-level sweep.
    These are high-load probes, not qualified performance outcomes. Invalid HTTP
    baseline measurements stop the campaign; a clean overload level is retained
    but cannot calibrate that offered rate.
-2. Select each product's highest passing probe level within the calibrated HTTP
-   baseline range, HEAD's candidate for every product, and the highest jointly
-   passing probe level when available. Other cells are not repeated. Candidates
-   and unresolved products are saved in `campaign-plan.json`.
+2. Confirm at most HEAD's adjacent passing/failing candidate endpoints with all
+   supported peers present. Avoid repeating every peer's individual probe rate.
+   Non-monotonic HEAD evidence stops selection. Probe bounds, refinement decisions,
+   unresolved products and workload cases are saved in `campaign-plan.json`.
+   `search_status` records target/observed probe gaps and budget exhaustion; reaching
+   the budget does not count as reaching the requested resolution.
 3. Confirm selected cells using 5-second warmup, **30-second measurement, five
    repetitions**, alternating product order, identical slots/quotas/resources
    and fresh per-round state. Every confirmation includes baseline and HEAD.
-   All builds complete before traffic; repeated phase builds use local Docker
-   caches and still enforce locked source builds.
+   The first phase builds every adapter and the generator from locked source.
+   Subsequent phases use `--reuse-build-manifest`: current SHA, all source hashes,
+   Rust/build settings, image IDs, OS and native architecture must still match.
+   Source/image drift stops the campaign. This avoids repeated builds and is
+   stricter than unchecked `--skip-build` (still forbidden for formal compare).
 4. Keep probes and confirmations labeled in raw data. Only confirmations can
    establish qualified levels or directional cost results. A passing top probe
    does not establish an unbounded maximum; an unbracketed boundary stays unknown.
+5. Exercise the representative cardinality/response matrix below at a conservative
+   shared offered level (80% of the common passing probe, or 80% of the lowest
+   available passing candidate if none is common, with a 5k floor). Each case gets one short survey, at most
+   one lower-rate fallback, then the same 30-second/five-repeat confirmation.
+   Invalid or insufficiently exercised products are explicitly marked/skipped
+   rather than wasting long repeats; missing baseline/HEAD coverage fails the
+   campaign. A fallback at the same 5k floor is not repeated.
+
+Default representative matrix:
+
+| Measured clients | Mode | Purpose |
+| ---: | --- | --- |
+| 1 | allow | Hot-key capacity bracket and reference workload |
+| 100 | allow | Isolate cardinality from the hot-key case |
+| 10,000 | allow | High-cardinality state/lookup cost |
+| 100 | mixed | Compare response paths at fixed cardinality |
+| 100 | reject | Mostly rejected requests with positive quotas |
+
+`reject` uses about 1% nominal admissions (minimum quota one), so governor and
+trypema participate without an artificial zero quota. `deny` remains the optional
+legacy zero-quota case. Mixed quota targets half of per-client attempts. Counts
+are observed: mixed requires 20%-80% 429s; reject requires >=90% 429s. If a large
+client population needs more requests to reach that rejection fraction, its short
+survey is extended within the existing 60-second ceiling. Every requested identity
+must actually be observed. Baseline ignores quotas and always permits requests.
+
+This five-case design isolates the two main factors; it does not cover every
+interaction. `--full-matrix` (or manual dispatch input **full_matrix**) opts into all
+nine combinations, including high-cardinality rejection. Both modes retain five
+long repeats rather than reducing statistical quality to fit more cases. Warmup
+uses separate identities which can remain resident alongside measured identities;
+RSS/Redis bytes include warmup/readiness state, not a pure per-measured-client size.
+
+With five supported Memory products the default has **at most 150 long rounds /
+5250 seconds of warmup+measurement**, versus 120 / 4200 for the four Redis products.
+These are upper bounds; missing bounds and skipped invalid cases reduce work.
+Short probes, startup/diagnostics/cleanup and the first cold build are additional.
+The expanded workload coverage costs more than the former all-allow-only campaign,
+but avoids multiplying nine cases by every rate in a fine sweep. `--plan` exposes
+the case list and round/load bounds before Docker runs. Runner timeouts are 180
+minutes for representative coverage and 240 for the explicit full matrix; these
+are cancellation limits, not promised runtime.
 
 ```sh
 python3 benchmarks/campaign.py --backend memory --output benchmarks/results/memory --plan
 python3 benchmarks/campaign.py --backend memory --output benchmarks/results/memory
 python3 benchmarks/campaign.py --backend redis --output benchmarks/results/redis
+# Opt into all nine interactions, or tune the bounded search:
+python3 benchmarks/campaign.py --backend redis --full-matrix --resolution 1000 --output benchmarks/results/full-redis --plan
 # Short orchestration check, never a qualified result:
 python3 benchmarks/campaign.py --backend memory --check --allow-dirty --output benchmarks/results/campaign-check
 ```
@@ -465,7 +523,19 @@ a container-lifetime peak; RSS and Redis memory remain snapshots.
   or CPU capture skew above 2% of the measurement interval yields `inconclusive`.
   RSS snapshots are not ranked.
 
+**Confirmed passing and failing bounds** lists each product's highest confirmed
+passing level, lowest confirmed failing level, gap and censoring/non-monotonic
+state for each workload. Short probe intervals are separate from these confirmed
+bounds. If an endpoint fails long confirmation, the report does not manufacture a
+stable range from short probes or silently run an unlimited search. Intermediate
+untested rates are not claimed to have passed.
+
 All-allow comparisons require every HTTP response to be allowed: unexpected 429s
 fail the workload even for algorithms without an equivalent sliding-log oracle.
 Different policies still retain their own guarantees. Reports may legitimately
 show no winner; selecting a favorable rate or ignoring errors cannot create one.
+Mixed/reject cases also require peer/HEAD rejection fractions to match within two
+percentage points for directional results. Otherwise ratios remain descriptive and
+the verdict is inconclusive, preventing cheaper rejection from masquerading as an
+implementation win. The workload coverage table exposes requested/observed IDs,
+200/429 totals, rejection-fraction ranges and asserted first-window admission counts.

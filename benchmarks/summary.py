@@ -8,6 +8,7 @@ from pathlib import Path
 import report
 import comparison
 import verdicts
+import workloads
 
 
 def expected_historical(round_):
@@ -74,6 +75,9 @@ def render(folder, status='unknown', artifact_url=''):
                   f"Resource layout: `{esc(json.dumps(env.get('resource_layout',{}),sort_keys=True))}`.",'']
         if env.get('resource_layout',{}).get('shared_cpuset'):
             lines += ['CI shares CPU sets explicitly; these measurements are not comparable to the disjoint local Safe layout.','']
+        search=env.get('campaign',{}).get('plan',{}).get('search_status')
+        if search:
+            lines += [f"Short-probe refinement: target gap **{search['target_gap_rps']} RPS**; HEAD probe gap **{search.get('head_probe_gap_rps')}**; extra rates **{search['extra_probes_used']}/{search['extra_probe_budget']}**; budget exhausted: **{search['budget_exhausted']}**. Only the confirmed-bound table establishes long-repeat evidence.",'']
     if rows:
         conclusions=verdicts.markdown(verdicts.analyze(rows))
         if conclusions: lines += [conclusions,'']
@@ -130,6 +134,7 @@ def render(folder, status='unknown', artifact_url=''):
                     (len({r.get('repeat') for r in items})==len(items),'duplicate or missing repeat IDs'),
                     (all(r.get('measurement_seconds',0)>=30 for r in items),'confirmation shorter than 30 seconds'),
                     (all(not r['invalid_reasons'] for r in items),'measurement invalid'),
+                    (all(not r['load_failure_reasons'] for r in items),'workload/load criteria not met'),
                     (all(r.get('dropped_capacity',0)==0 for r in items),'in-flight limit reached'),
                     (all(r.get('http_rps',r.get('achieved_rps',0))>=.99*r.get('target_rps',1) for r in items),'completion below 99%'),
                     (all((r.get('scheduled_latency',{}).get('p99_ms') or float('inf'))<=10 for r in items),'scheduled p99 above 10ms'),
@@ -149,6 +154,7 @@ def render(folder, status='unknown', artifact_url=''):
                   '| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |']
         for c in contrasts:
             lines.append('| '+esc(c['variant']+' / '+c['scenario'])+' | '+esc(c['algorithm'])+' | '+str(c['repeats'])+' | '+' | '.join(fmt(c[key]) for key in ('p99_ratio','cpu_ratio','rss_ratio','redis_ratio'))+' | '+esc(c['evidence'])+' |')
+    lines += ['', workloads.markdown(rows)]
     if rows:
         lines += ['', '## Transport and connection diagnostics','',
                   '| Variant / scenario | Error categories | First error phase ms | New / reused / idle expired / idle discarded |',

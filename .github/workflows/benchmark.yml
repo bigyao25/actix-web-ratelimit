@@ -8,6 +8,11 @@ on:
         default: compare
         type: choice
         options: [compare, smoke, defect]
+      full_matrix:
+        description: 'Run all nine client/mode combinations instead of five representative cases'
+        required: false
+        default: false
+        type: boolean
 permissions:
   contents: read
 concurrency:
@@ -34,7 +39,7 @@ jobs:
     name: Benchmark (${{ matrix.shard }})
     needs: prepare
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: ${{ inputs.full_matrix && 240 || 180 }}
     strategy:
       fail-fast: false
       max-parallel: 2
@@ -49,11 +54,14 @@ jobs:
         env:
           BENCHMARK_SUITE: ${{ inputs.suite }}
           BENCHMARK_BACKENDS: ${{ matrix.backends }}
+          BENCHMARK_FULL_MATRIX: ${{ inputs.full_matrix }}
         run: |
           mkdir -p benchmarks/results/ci
           set -euo pipefail
           if [ "$BENCHMARK_SUITE" = compare ]; then
-            python3 benchmarks/campaign.py --backend "$BENCHMARK_BACKENDS" --output benchmarks/results/ci 2>&1 | tee benchmarks/results/ci/run.log
+            options=()
+            if [ "$BENCHMARK_FULL_MATRIX" = true ]; then options+=(--full-matrix); fi
+            python3 benchmarks/campaign.py --backend "$BENCHMARK_BACKENDS" "${options[@]}" --output benchmarks/results/ci 2>&1 | tee benchmarks/results/ci/run.log
             exit 0
           elif [ "$BENCHMARK_SUITE" = defect ]; then
             resource=ci

@@ -219,3 +219,54 @@ Production sources/dependencies, existing project tests and the normal CI workfl
 remain unchanged. No rlbench containers or networks remained after verification;
 images, caches and ignored reports were retained. No commit, push or workflow
 dispatch was performed.
+
+## Representative workloads and bounded capacity refinement
+
+The default campaign now separates cardinality (1/100/10,000 measured clients,
+all allowed) from response paths (100 clients, mixed and positive-quota mostly
+rejected requests). Full nine-way interaction coverage is opt-in. Requested IDs,
+observed IDs, 200/429 fractions and asserted first-window admission totals are
+reported. Mixed requires 20%-80% rejections and mostly rejected traffic >=90%.
+Non-equivalent response fractions cannot produce directional cost/load results.
+
+Capacity starts at Memory 45k/60k or Redis 10k/16k, with bounded midpoint/range
+selection rather than testing every suggested fixed rate. Targets are 5k/2k gaps,
+at most three additional short levels by default, and at most HEAD's adjacent
+candidate endpoints are promoted to long confirmation. Unbounded/non-monotonic,
+budget-exhausted and long-confirmation failures stay explicit. Candidate selection,
+resolution status and confirmed intervals have synthetic regression coverage;
+these fixtures are not observed capacity data.
+
+Every selected long case retains five 30-second repeats. Runtime is reduced
+relative to a full case-by-rate product by choosing representative cases, one
+survey/fallback level per additional case, and only boundary endpoint confirmations.
+The first phase builds; later phases verify source/build settings and native image
+IDs against its manifest. Source or image drift refuses reuse. This avoids phase
+rebuilds without using unchecked skip-build. An initial pre-traffic variable-name
+collision was fixed; no service containers had started. Cleanup now also avoids
+an unnecessary down call before startup or after successful teardown.
+
+Actual local verification on Apple Silicon with the existing bounded CPU/memory
+layout:
+
+- All supported competitor Memory/Redis mixed/reject paths: eighteen 10k RPS,
+  2-second cells, 360,000 HTTP 200/429 responses, zero transport/errors/drops/OOM.
+  HEAD mixed admitted/rejected 10,000/10,000 per cell; positive-quota reject
+  admitted/rejected 200/19,800. GCRA's mixed Memory result was 10,300/9,700,
+  retained as an observed semantic difference rather than an exact-oracle error.
+- Expanded baseline/HEAD campaign check: twenty 15k RPS, 2-second cells covering
+  all five representative cases, 600,000 responses, zero errors/drops/OOM.
+  All four high-cardinality survey/confirmation cells observed 10,000 identities.
+  Nine later phase manifests verified reuse, with no repeated build invocation.
+  One baseline high-cardinality confirmation recorded scheduled p99 11.85ms,
+  exceeding the 10ms criterion; it remains a clean load failure in the report.
+  Short checks produced no qualified capacity/cost winners or confirmed bounds.
+
+Sixty-eight Python tooling tests passed, including bounded search, invalid/CPU-
+limited probe rejection, non-monotonic evidence, resolution/budget status,
+positive quotas, coverage, response-mix matching and provenance drift refusal.
+Actionlint, Python compilation and diff whitespace checks passed. Production
+crate sources/dependencies and normal CI are unchanged. No rlbench containers or
+networks remained; ignored results and reusable images/caches remain. No remote
+long run, commit, push or workflow dispatch was performed. Actual stable capacity
+intervals still require the manual long campaign on the target runner.
