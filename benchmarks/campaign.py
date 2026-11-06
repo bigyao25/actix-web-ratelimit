@@ -94,11 +94,13 @@ def main():
     probe_seconds,warmup,seconds,repeats=(2,1,2,1) if a.check else (5,5,30,5)
     cases=workloads.cases(a.full_matrix)
     if a.plan:
-        short_rounds=(len(rates)+(0 if a.check else a.refine_budget)+2*(len(cases)-1))*len(peers)
+        calibration_rounds=0 if a.check else capacity.LOADGEN_STEPS
+        short_rounds=(len(rates)+(0 if a.check else a.refine_budget)+2*(len(cases)-1))*len(peers)+calibration_rounds
         print(json.dumps(dict(backend=a.backend,variants=peers,probe_rates=rates,
                              operational_check=a.check,probe_seconds=probe_seconds,probe_warmup=1 if a.check else 2,confirmation_seconds=seconds,
                              confirmation_warmup=warmup,confirmation_repeats=repeats,
                              cases=cases,resolution_rps=resolution,refinement_budget=0 if a.check else a.refine_budget,
+                             calibration_probes=calibration_rounds,loadgen_headroom=capacity.LOADGEN_HEADROOM,
                              max_confirmation_rounds=(len(cases)+1)*len(peers)*repeats,
                              max_confirmation_load_seconds=(len(cases)+1)*len(peers)*repeats*(seconds+warmup),
                              max_short_rounds=short_rounds,
@@ -110,9 +112,10 @@ def main():
     manifest=None
     def interrupted(*_): raise KeyboardInterrupt()
     signal.signal(signal.SIGTERM,interrupted)
-    def execute(name,stage,selected,levels,seconds,warmup,repeats,clients=1,mode='allow'):
+    def execute(name,stage,selected,levels,seconds,warmup,repeats,clients=1,mode='allow',record=True):
         nonlocal manifest
-        child=a.output/name;children.append((child,stage))
+        child=a.output/name
+        if record: children.append((child,stage))
         cmd=[sys.executable,str(HERE/'bench.py'),'compare','--backends',a.backend,
              '--variants',*selected,'--rates',*map(str,levels),'--duration',str(seconds),
              '--warmup',str(warmup),'--repeats',str(repeats),'--output',str(child)]
@@ -130,7 +133,27 @@ def main():
                 except subprocess.TimeoutExpired: process.kill();process.wait()
         if manifest is None: manifest=child/'environment.json'
         return json.loads((child/'raw.json').read_text())['rounds']
+    def probe_quietly(name,levels):
+        """Short baseline probe that tolerates the invalid-baseline abort."""
+        nonlocal manifest
+        try: return execute(name,'probe',['baseline'],levels,probe_seconds,2,1,record=False)
+        except RuntimeError:
+            raw=a.output/name/'raw.json';env=a.output/name/'environment.json'
+            # Reuse the build only when images were actually recorded; otherwise rebuild.
+            manifest=env if env.exists() and json.loads(env.read_text()).get('images') else None
+            return json.loads(raw.read_text())['rounds'] if raw.exists() else []
     try:
+        calibration=dict(initial=list(rates),steps=[],adjusted=False)
+        # Explicit --probe-rates are honoured; only the default ladder self-calibrates.
+        if not a.check and a.probe_rates is None:
+            for step in range(capacity.LOADGEN_STEPS):
+                observed=probe_quietly('calibrate-'+str(step),[rates[-1]])
+                decision=capacity.ladder_step(rates,observed,resolution)
+                calibration['steps'].append(decision or dict(rate=rates[-1],pressure=False))
+                if decision is None: break
+                rates=decision['rates']
+        calibration['final']=list(rates)
+        calibration['adjusted']=rates!=calibration['initial']
         anchor=execute('probe','probe',peers,rates,probe_seconds,1 if a.check else 2,1)
         for i in range(0 if a.check else a.refine_budget):
             decision=capacity.next_probe(anchor,peers,resolution)
@@ -139,6 +162,7 @@ def main():
             anchor += execute('refine-'+str(i),'probe',peers,[decision['rate']],probe_seconds,2,1)
         collect(a.output,children,a.check)
         plan,details=confirmation_plan(anchor,a.backend,peers)
+        details['calibration']=calibration
         details['search_status']=capacity.search_status(anchor,peers,resolution,len(trace),0 if a.check else a.refine_budget,a.check)
         def save_plan():
             (a.output/'campaign-plan.json').write_text(json.dumps(dict(confirmations=plan,refinement_trace=trace,

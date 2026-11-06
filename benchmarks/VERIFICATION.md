@@ -270,3 +270,33 @@ crate sources/dependencies and normal CI are unchanged. No rlbench containers or
 networks remained; ignored results and reusable images/caches remain. No remote
 long run, commit, push or workflow dispatch was performed. Actual stable capacity
 intervals still require the manual long campaign on the target runner.
+
+## Generator calibration after run 42109644774
+
+The manual `compare` run on `f8408fc9` failed in the Memory shard and produced no
+confirmed bound in the Redis shard. Both outcomes trace to the harness, not to the
+limiter implementations.
+
+- Memory aborted after six rounds. `baseline` at 60k RPS recorded loadgen CPU
+  198.2% of a 200% quota, dispatch p99 100.7 ms, 8,918 late drops and 5,950
+  capacity drops, so `report.validate` returned `scheduler_drops` and
+  `invalid_comparison_baseline` stopped the campaign. The generator was CPU-bound,
+  not cgroup-throttled (1,253 us of throttling over 5 s). The 45k probe had already
+  consumed 78.6% of the same quota, leaving no headroom for the next step.
+- Redis completed 232 clean rounds but confirmed no upper bound. 16k passed for
+  every variant; at 31k `baseline` passed 5/5 while `head` passed 3/5,
+  `extensible` 1/5 and `trypema` 0/5, all failing on the 512-slot in-flight cap
+  rather than server CPU. Mixed outcomes cannot form a bracket, and the 2,000 RPS
+  resolution budget was exhausted.
+
+Changes: `capacity.ladder_step` scales the default ladder down when the generator
+reaches 70% of its own quota or misses scheduled arrivals, `campaign.py` runs up to
+two short baseline-only calibration probes before the probe phase and records the
+decision as `calibration` in `campaign-plan.json`, and `bench.py` prints one
+diagnostic line per round plus an explicit generator-pressure warning. Explicit
+`--probe-rates` are never rescaled.
+
+Verification: seventy-four Python tooling tests pass. Replaying the recorded 60k
+round through `ladder_step` yields `[30000, 40000]`; the projected 40k probe sits at
+0.699 of the generator quota, so calibration stops after one step. No remote rerun
+was performed, so the fix is not yet demonstrated on a hosted runner.

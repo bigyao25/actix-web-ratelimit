@@ -2,6 +2,7 @@
 import io
 import json
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -9,6 +10,7 @@ import unittest
 sys.path.insert(0,str(Path(__file__).parents[1]))
 import bench
 import campaign
+import capacity
 import verdicts
 import workflow
 import test_summary
@@ -55,6 +57,17 @@ class CampaignTest(unittest.TestCase):
         self.assertEqual(p.stdin.getvalue(),'measurement_ready\nmeasurement_complete\n')
         self.assertGreaterEqual(seconds,0)
 
+    def test_round_diagnostic_exposes_generator_pressure(self):
+        result=dict(http_rps=56283.79,target_rps=60000,p99_ms=6.89,
+                    scheduled_latency={'p99_ms':106.0},loadgen_cpu_pct=198.2,loadgen_cpu_limit=2,
+                    server_cpu_pct=80.0,server_cpu_limit=1,dropped_capacity=5950,dropped_late=8918,errors=0)
+        line=bench.round_diagnostic(result,60000)
+        for token in ('http=56284/60000','sched_p99=106.00ms','loadgen_cpu=198.2%/2','drop_late=8918'):
+            self.assertIn(token,line)
+        self.assertTrue(bench.generator_pressure(result))
+        self.assertFalse(bench.generator_pressure({**result,'dropped_late':0,'loadgen_cpu_pct':100}))
+        self.assertIn('sched_p99=n/a',bench.round_diagnostic({'achieved_rps':1},1))
+
     def test_phase_without_complete_event_is_rejected(self):
         class Process:
             stdout=io.StringIO('{"event":"measurement_ready"}\n')
@@ -62,6 +75,13 @@ class CampaignTest(unittest.TestCase):
             returncode=0
             def wait(self): return 0
         with self.assertRaises(RuntimeError): bench.controlled_measurement(Process(),lambda: {})
+
+    def test_plan_counts_generator_calibration_probes(self):
+        output=subprocess.check_output([sys.executable,str(Path(__file__).parents[1]/'campaign.py'),
+                                        '--backend','memory','--output','unused','--plan'],text=True)
+        plan=json.loads(output)
+        self.assertEqual(plan['calibration_probes'],capacity.LOADGEN_STEPS)
+        self.assertEqual(plan['loadgen_headroom'],capacity.LOADGEN_HEADROOM)
 
     def test_collection_rejects_cross_host_or_changed_source_phases(self):
         for changed in ('host','source'):
@@ -74,6 +94,37 @@ class CampaignTest(unittest.TestCase):
                     (child/'raw.json').write_text(json.dumps({'rounds':[row('head',platform_id=platform)]}))
                     (child/'environment.json').write_text(json.dumps({'git_sha':'sha','source_hashes':hashes}))
                 with self.assertRaises(RuntimeError): campaign.collect(root,children)
+
+
+class CapacityTest(unittest.TestCase):
+    def saturated(self, **changes):
+        fields=dict(schema_version=3,http_200=285132,sample_count=285132,dropped=14868,
+                    dropped_capacity=5950,dropped_late=8918,scheduled=300000,loadgen_saturated=True,
+                    error_categories={},achieved_rps=56283.79,http_rps=56283.79,offered_rps=60000,
+                    loadgen_cpu_pct=198.2,loadgen_cpu_limit=2,mean_in_flight=50.5,
+                    peak_in_flight=512,concurrency_limit=512)
+        fields.update(changes)
+        return row('baseline',60000,**fields)
+
+    def test_saturated_generator_scales_the_ladder_down(self):
+        decision=capacity.ladder_step([45000,60000],[self.saturated()],5000)
+        self.assertIsNotNone(decision)
+        self.assertEqual(decision['rates'],[30000,40000])
+        self.assertLess(decision['rates'][-1],60000)
+        self.assertEqual(decision['dropped_late'],8918)
+
+    def test_healthy_generator_keeps_the_configured_ladder(self):
+        healthy=self.saturated(dropped=0,dropped_capacity=0,dropped_late=0,scheduled=285132,
+                               loadgen_saturated=False,loadgen_cpu_pct=100)
+        self.assertIsNone(capacity.ladder_step([45000,60000],[healthy],5000))
+
+    def test_transport_errors_are_not_generator_pressure(self):
+        broken=self.saturated(errors=1,error_categories={'timeout':1},http_200=285131)
+        self.assertIsNone(capacity.ladder_step([45000,60000],[broken],5000))
+
+    def test_single_rate_ladder_still_scales(self):
+        decision=capacity.ladder_step([60000],[self.saturated()],5000)
+        self.assertEqual(decision['rates'],[40000])
 
 
 class VerdictTest(unittest.TestCase):
