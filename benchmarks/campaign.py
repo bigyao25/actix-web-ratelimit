@@ -134,9 +134,14 @@ def main():
         if manifest is None: manifest=child/'environment.json'
         return json.loads((child/'raw.json').read_text())['rounds']
     def probe_quietly(name,levels):
-        """Short baseline probe that tolerates the invalid-baseline abort."""
+        """Short probe that tolerates the invalid-baseline abort.
+
+        Every peer is selected so this phase builds all images; the main probe
+        phase reuses that manifest and would otherwise fail on a missing image.
+        Only baseline rows drive the ladder decision.
+        """
         nonlocal manifest
-        try: return execute(name,'probe',['baseline'],levels,probe_seconds,2,1,record=False)
+        try: return execute(name,'probe',peers,levels,probe_seconds,2,1,record=False)
         except RuntimeError:
             raw=a.output/name/'raw.json';env=a.output/name/'environment.json'
             # Reuse the build only when images were actually recorded; otherwise rebuild.
