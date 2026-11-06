@@ -95,6 +95,32 @@ let config = RateLimitConfig::default()
 
 完整的请求头识别和自定义限流响应代码见 [examples/advance.rs](examples/advance.rs)。
 
+### 可选的额度响应头
+
+响应头默认关闭。通过中间件开启 `RateLimit-Policy`、`RateLimit`，以及 HTTP 429 时可确定的 `Retry-After`：
+
+```rust
+use actix_web_ratelimit::{RateLimit, config::RateLimitConfig, store::MemoryStore};
+
+let config = RateLimitConfig::default().namespace("api").max_requests(100).window_secs(60);
+let middleware = RateLimit::new(config, MemoryStore::new()).response_headers(true);
+```
+
+示例响应头：
+
+```http
+RateLimit-Policy: "api";q=100;w=60
+RateLimit: "api";r=42
+```
+
+额度耗尽时，响应还可能包含：
+
+```http
+Retry-After: 12
+RateLimit-Policy: "api";q=100;w=60
+RateLimit: "api";r=0
+```
+
 ### Redis 存储
 
 `redis` 特性默认启用，快速开始中的依赖配置已包含 Redis 支持。如果需要关闭默认特性并仅显式启用 Redis 支持，请使用：
@@ -212,9 +238,10 @@ cargo test --locked --doc --no-default-features
 cargo publish --locked --dry-run
 REDIS_URL=redis://127.0.0.1:6379/ cargo test --locked --all-targets --all-features -- --include-ignored
 cargo bench --locked --bench memory --no-default-features
+cargo bench --locked --bench middleware --no-default-features
 ```
 
-Redis 测试使用独立前缀，不清空数据库。内存微基准覆盖 1、100、10,000 个客户端，其结果不代表 HTTP 吞吐保证。
+Redis 测试使用独立前缀，不清空数据库。微基准覆盖内存检查和可选响应头，其结果不代表 HTTP 吞吐保证。
 
 ## [features]
 

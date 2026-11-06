@@ -31,3 +31,7 @@ tokio = { version = "1", features = ["net", "io-util", "sync", "macros", "time"]
 [[bench]]
 name = "memory"
 harness = false
+
+[[bench]]
+name = "middleware"
+harness = false

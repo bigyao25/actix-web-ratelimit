@@ -1,6 +1,6 @@
 use crate::{
     config::RateLimitConfig,
-    store::{RateLimitStore, StoreError},
+    store::{RateLimitDecision, RateLimitMetadata, RateLimitStore, StoreError},
 };
 use futures_util::future::BoxFuture;
 use redis::{
@@ -42,6 +42,10 @@ impl Default for RedisStoreOptions {
 /// Clones multiplex the same connection and reconnect automatically. Initialize the
 /// store once before starting workers. Keys encode prefix, rule, window, quota and
 /// client ID. Client IDs should be internal identifiers, never raw credentials.
+///
+/// Detailed checks return quota metadata from the same atomic Lua invocation,
+/// normally requiring one network round trip. A script cache miss can require
+/// reloading the script. Fail-open decisions omit metadata because quota is unknown.
 #[derive(Clone)]
 pub struct RedisStore {
     connection: ConnectionManager,
@@ -112,7 +116,7 @@ impl RedisStore {
         )
     }
 
-    async fn check(&self, key: &str, config: &RateLimitConfig) -> RedisResult<bool> {
+    async fn check_limited(&self, key: &str, config: &RateLimitConfig) -> RedisResult<bool> {
         let mut connection = self.connection.clone();
         // Round up sub-microsecond durations so Redis never expires a request early.
         let window_micros = config.window_secs.as_nanos().div_ceil(1_000) as u64;
@@ -123,6 +127,55 @@ impl RedisStore {
             .invoke_async(&mut connection)
             .await?;
         Ok(limited)
+    }
+
+    async fn check_detailed(
+        &self,
+        key: &str,
+        config: &RateLimitConfig,
+    ) -> RedisResult<RateLimitDecision> {
+        let mut connection = self.connection.clone();
+        let window_micros = config.window_secs.as_nanos().div_ceil(1_000) as u64;
+        let (limited, remaining, retry_micros): (u8, usize, u64) = SCRIPT
+            .key(self.get_key(key, config))
+            .arg(window_micros)
+            .arg(config.max_requests)
+            .arg("details")
+            .invoke_async(&mut connection)
+            .await?;
+        match (limited, remaining, retry_micros) {
+            (0, remaining, 0) if remaining < config.max_requests => Ok(RateLimitDecision {
+                allowed: true,
+                metadata: Some(RateLimitMetadata {
+                    remaining,
+                    retry_after: None,
+                }),
+            }),
+            (1, 0, retry) if retry > 0 => Ok(RateLimitDecision {
+                allowed: false,
+                metadata: Some(RateLimitMetadata {
+                    remaining: 0,
+                    retry_after: Some(Duration::from_micros(retry)),
+                }),
+            }),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid Redis rate limit metadata",
+            )
+            .into()),
+        }
+    }
+
+    fn handle_error(&self, error: RedisError) -> Result<(), StoreError> {
+        // Do not log client IDs, Redis URLs or server-provided error details.
+        log::warn!(
+            "Redis rate limit check failed; policy={:?}",
+            self.options.failure_policy
+        );
+        match self.options.failure_policy {
+            FailurePolicy::FailOpen => Ok(()),
+            FailurePolicy::FailClosed => Err(StoreError::new(error)),
+        }
     }
 }
 
@@ -137,22 +190,43 @@ impl RateLimitStore for RedisStore {
             if config.max_requests == 0 {
                 return Ok(true);
             }
-            let result = tokio::time::timeout(self.options.timeout, self.check(key, config))
-                .await
-                .unwrap_or_else(|_| Err(Self::timeout_error()));
+            let result =
+                tokio::time::timeout(self.options.timeout, self.check_limited(key, config))
+                    .await
+                    .unwrap_or_else(|_| Err(Self::timeout_error()));
             match result {
                 Ok(limited) => Ok(limited),
-                Err(error) => {
-                    // Do not log client IDs, Redis URLs or server-provided error details.
-                    log::warn!(
-                        "Redis rate limit check failed; policy={:?}",
-                        self.options.failure_policy
-                    );
-                    match self.options.failure_policy {
-                        FailurePolicy::FailOpen => Ok(false),
-                        FailurePolicy::FailClosed => Err(StoreError::new(error)),
-                    }
-                }
+                Err(error) => self.handle_error(error).map(|()| false),
+            }
+        })
+    }
+
+    fn check<'a>(
+        &'a self,
+        key: &'a str,
+        config: &'a RateLimitConfig,
+    ) -> BoxFuture<'a, Result<RateLimitDecision, StoreError>> {
+        Box::pin(async move {
+            config.validate().map_err(StoreError::new)?;
+            if config.max_requests == 0 {
+                return Ok(RateLimitDecision {
+                    allowed: false,
+                    metadata: Some(RateLimitMetadata {
+                        remaining: 0,
+                        retry_after: None,
+                    }),
+                });
+            }
+            let result =
+                tokio::time::timeout(self.options.timeout, self.check_detailed(key, config))
+                    .await
+                    .unwrap_or_else(|_| Err(Self::timeout_error()));
+            match result {
+                Ok(decision) => Ok(decision),
+                Err(error) => self.handle_error(error).map(|()| RateLimitDecision {
+                    allowed: true,
+                    metadata: None,
+                }),
             }
         })
     }

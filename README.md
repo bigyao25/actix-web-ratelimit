@@ -95,6 +95,32 @@ let config = RateLimitConfig::default()
 
 For header-based identification and a custom rate limit response, see [examples/advance.rs](examples/advance.rs).
 
+### Optional Quota Response Headers
+
+Response headers are disabled by default. Enable `RateLimit-Policy`, `RateLimit` and, on HTTP 429 when available, `Retry-After`:
+
+```rust
+use actix_web_ratelimit::{RateLimit, config::RateLimitConfig, store::MemoryStore};
+
+let config = RateLimitConfig::default().namespace("api").max_requests(100).window_secs(60);
+let middleware = RateLimit::new(config, MemoryStore::new()).response_headers(true);
+```
+
+Example response headers:
+
+```http
+RateLimit-Policy: "api";q=100;w=60
+RateLimit: "api";r=42
+```
+
+When the quota is exhausted, a response can also include:
+
+```http
+Retry-After: 12
+RateLimit-Policy: "api";q=100;w=60
+RateLimit: "api";r=0
+```
+
 ### Redis Store
 
 The `redis` feature is enabled by default, so the Quick Start dependency already includes Redis support. To disable default features and enable only Redis support explicitly, use:
@@ -212,9 +238,10 @@ cargo test --locked --doc --no-default-features
 cargo publish --locked --dry-run
 REDIS_URL=redis://127.0.0.1:6379/ cargo test --locked --all-targets --all-features -- --include-ignored
 cargo bench --locked --bench memory --no-default-features
+cargo bench --locked --bench middleware --no-default-features
 ```
 
-Redis tests use isolated prefixes and never flush the database. The memory microbenchmark covers 1, 100 and 10,000 clients; its results are not HTTP throughput guarantees.
+Redis tests use isolated prefixes and never flush the database. Microbenchmarks cover memory checks and optional response headers; their results are not HTTP throughput guarantees.
 
 ## [features]
 
