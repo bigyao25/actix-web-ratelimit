@@ -82,7 +82,7 @@ where
     store: Arc<S>,
     config: Arc<RateLimitConfig>,
     response_headers: bool,
-    observer: Option<Arc<dyn RateLimitObserver>>,
+    observer: Option<Arc<observability::ObserverState>>,
 }
 
 impl<S> RateLimit<S>
@@ -151,7 +151,7 @@ where
     ///     });
     /// ```
     pub fn observe(mut self, observer: impl RateLimitObserver + 'static) -> Self {
-        self.observer = Some(Arc::new(observer));
+        self.observer = Some(Arc::new(observability::ObserverState::new(observer)));
         self
     }
 }
