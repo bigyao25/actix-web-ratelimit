@@ -18,6 +18,7 @@ A simple and highly customizable rate limiting middleware for actix-web 4.
 - **High Performance**: Efficient sliding window algorithm
 - **Customizable**: Custom client identification and rate limit exceeded handlers
 - **Thread Safe**: Concurrent request handling with DashMap
+- **Observability**: Optional, backend-agnostic event hooks for rate-limit decisions, storage failures, and check latency. See [the example](examples/observability.rs).
 
 Requires Rust 1.89 or newer. Redis integration tests target Redis 7 and 8.
 

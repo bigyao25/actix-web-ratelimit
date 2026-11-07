@@ -1,5 +1,6 @@
 use crate::{
     config::RateLimitConfig,
+    observability::ObservedRateLimitDecision,
     store::{RateLimitDecision, RateLimitMetadata, RateLimitStore, StoreError},
 };
 use futures_util::future::BoxFuture;
@@ -180,6 +181,56 @@ impl RedisStore {
 }
 
 impl RateLimitStore for RedisStore {
+    fn check_observed<'a>(
+        &'a self,
+        key: &'a str,
+        config: &'a RateLimitConfig,
+        metadata: bool,
+    ) -> BoxFuture<'a, Result<ObservedRateLimitDecision, StoreError>> {
+        Box::pin(async move {
+            config.validate().map_err(StoreError::new)?;
+            if config.max_requests == 0 {
+                return Ok(RateLimitDecision {
+                    allowed: false,
+                    metadata: metadata.then_some(RateLimitMetadata {
+                        remaining: 0,
+                        retry_after: None,
+                    }),
+                }
+                .into());
+            }
+            let result = tokio::time::timeout(self.options.timeout, async {
+                if metadata {
+                    self.check_detailed(key, config).await
+                } else {
+                    self.check_limited(key, config)
+                        .await
+                        .map(|limited| RateLimitDecision {
+                            allowed: !limited,
+                            metadata: None,
+                        })
+                }
+            })
+            .await
+            .unwrap_or_else(|_| Err(Self::timeout_error()));
+            match result {
+                Ok(decision) => Ok(decision.into()),
+                Err(error) => {
+                    let kind = super::traits::classify_redis_error(&error);
+                    self.handle_error(error)?;
+                    Ok(ObservedRateLimitDecision {
+                        decision: RateLimitDecision {
+                            allowed: true,
+                            metadata: None,
+                        },
+                        fail_open: true,
+                        error_kind: Some(kind),
+                    })
+                }
+            }
+        })
+    }
+
     fn is_limited<'a>(
         &'a self,
         key: &'a str,

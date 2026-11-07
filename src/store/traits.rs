@@ -1,4 +1,5 @@
 use crate::config::RateLimitConfig;
+use crate::observability::{ObservedRateLimitDecision, RateLimitErrorKind};
 use futures_util::future::BoxFuture;
 use std::{error::Error, fmt, sync::Arc, time::Duration};
 
@@ -29,6 +30,38 @@ pub struct StoreError(Box<dyn Error + Send + Sync>);
 impl StoreError {
     pub fn new(error: impl Error + Send + Sync + 'static) -> Self {
         Self(Box::new(error))
+    }
+
+    /// Best-effort classification; never formats or exposes the error message.
+    pub fn kind(&self) -> RateLimitErrorKind {
+        #[cfg(feature = "redis")]
+        if let Some(error) = self.0.downcast_ref::<redis::RedisError>() {
+            return classify_redis_error(error);
+        }
+        if let Some(error) = self.0.downcast_ref::<std::io::Error>() {
+            return match error.kind() {
+                std::io::ErrorKind::TimedOut => RateLimitErrorKind::Timeout,
+                std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::NotConnected
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::UnexpectedEof => RateLimitErrorKind::Connection,
+                _ => RateLimitErrorKind::Other,
+            };
+        }
+        RateLimitErrorKind::Other
+    }
+}
+
+#[cfg(feature = "redis")]
+pub(crate) fn classify_redis_error(error: &redis::RedisError) -> RateLimitErrorKind {
+    if error.is_timeout() {
+        RateLimitErrorKind::Timeout
+    } else if error.is_io_error() {
+        RateLimitErrorKind::Connection
+    } else {
+        RateLimitErrorKind::Backend
     }
 }
 
@@ -67,6 +100,32 @@ impl Error for StoreError {
 /// }
 /// ```
 pub trait RateLimitStore: Send + Sync {
+    /// Optional observation path, used only when an observer is registered.
+    /// Calls exactly one existing method: `check` if metadata is requested,
+    /// otherwise `is_limited`. Override to report explicit fail-open state;
+    /// missing metadata alone never means fail-open. Return only after releasing
+    /// storage locks. `Arc` and `Box` forward this method as well. Stores with
+    /// their own fail-open policy must override this method to identify it;
+    /// the default cannot discover degradation hidden by legacy return values.
+    fn check_observed<'a>(
+        &'a self,
+        key: &'a str,
+        config: &'a RateLimitConfig,
+        metadata: bool,
+    ) -> BoxFuture<'a, Result<ObservedRateLimitDecision, StoreError>> {
+        Box::pin(async move {
+            let decision = if metadata {
+                self.check(key, config).await?
+            } else {
+                RateLimitDecision {
+                    allowed: !self.is_limited(key, config).await?,
+                    metadata: None,
+                }
+            };
+            Ok(decision.into())
+        })
+    }
+
     fn is_limited<'a>(
         &'a self,
         key: &'a str,
@@ -97,6 +156,15 @@ pub trait RateLimitStore: Send + Sync {
 }
 
 impl<T: RateLimitStore + ?Sized> RateLimitStore for Box<T> {
+    fn check_observed<'a>(
+        &'a self,
+        key: &'a str,
+        config: &'a RateLimitConfig,
+        metadata: bool,
+    ) -> BoxFuture<'a, Result<ObservedRateLimitDecision, StoreError>> {
+        (**self).check_observed(key, config, metadata)
+    }
+
     fn is_limited<'a>(
         &'a self,
         key: &'a str,
@@ -115,6 +183,15 @@ impl<T: RateLimitStore + ?Sized> RateLimitStore for Box<T> {
 }
 
 impl<T: RateLimitStore + ?Sized> RateLimitStore for Arc<T> {
+    fn check_observed<'a>(
+        &'a self,
+        key: &'a str,
+        config: &'a RateLimitConfig,
+        metadata: bool,
+    ) -> BoxFuture<'a, Result<ObservedRateLimitDecision, StoreError>> {
+        (**self).check_observed(key, config, metadata)
+    }
+
     fn is_limited<'a>(
         &'a self,
         key: &'a str,
