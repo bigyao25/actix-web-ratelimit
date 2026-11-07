@@ -374,12 +374,17 @@ async fn callback_runs_after_memory_locks_release() {
 #[actix_web::test]
 async fn callback_panic_preserves_admission_and_rejection() {
     for headers in [false, true] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = calls.clone();
         let app = test::init_service(
             App::new()
                 .wrap(
                     RateLimit::new(config(1), MemoryStore::new())
                         .response_headers(headers)
-                        .observe(|_: &RateLimitEvent<'_>| panic!("observer")),
+                        .observe(move |_: &RateLimitEvent<'_>| {
+                            callback_calls.fetch_add(1, Ordering::Relaxed);
+                            panic!("observer");
+                        }),
                 )
                 .default_service(web::to(|| async { HttpResponse::Ok().finish() })),
         )
@@ -389,6 +394,52 @@ async fn callback_panic_preserves_admission_and_rejection() {
             assert_eq!(response.status(), status);
             assert_eq!(response.headers().contains_key("ratelimit"), headers);
         }
+        // The first panic disables subsequent callbacks for this registration.
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+}
+
+struct PanicPayload {
+    drops: Arc<AtomicUsize>,
+    panic_on_drop: bool,
+}
+
+impl Drop for PanicPayload {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::Relaxed);
+        if self.panic_on_drop {
+            panic!("payload destructor");
+        }
+    }
+}
+
+#[actix_web::test]
+async fn panicking_payloads_are_dropped_and_observer_is_disabled() {
+    for panic_on_drop in [false, true] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let callback_calls = calls.clone();
+        let payload_drops = drops.clone();
+        let app = test::init_service(
+            App::new()
+                .wrap(RateLimit::new(config(1), MemoryStore::new()).observe(
+                    move |_: &RateLimitEvent<'_>| {
+                        callback_calls.fetch_add(1, Ordering::Relaxed);
+                        std::panic::panic_any(PanicPayload {
+                            drops: payload_drops.clone(),
+                            panic_on_drop,
+                        });
+                    },
+                ))
+                .default_service(web::to(|| async { HttpResponse::Ok().finish() })),
+        )
+        .await;
+        for status in [StatusCode::OK, StatusCode::TOO_MANY_REQUESTS] {
+            let response = test::call_service(&app, test::TestRequest::get().to_request()).await;
+            assert_eq!(response.status(), status);
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
     }
 }
 

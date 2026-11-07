@@ -337,6 +337,56 @@ async fn malformed_metadata_follows_failure_policy_without_fabricating_quota() {
 }
 
 #[actix_web::test]
+async fn semantic_metadata_errors_are_reported_as_backend_not_connection() {
+    use actix_web::{App, HttpResponse, http::StatusCode, test, web};
+    use actix_web_ratelimit::{
+        RateLimit,
+        observability::{RateLimitErrorKind, RateLimitEvent, RateLimitOutcome},
+    };
+    use std::sync::Mutex;
+
+    // Valid RESP array, but an impossible rejected decision: remaining != 0.
+    const INVALID_METADATA: &[u8] = b"*3\r\n:1\r\n:1\r\n:0\r\n";
+    for policy in [FailurePolicy::FailOpen, FailurePolicy::FailClosed] {
+        let server = Server::start(Scenario::Metadata(INVALID_METADATA)).await;
+        let store = server.store(policy, Duration::from_secs(1)).await;
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let callback_events = events.clone();
+        let app = test::init_service(
+            App::new()
+                .wrap(
+                    RateLimit::new(RateLimitConfig::default(), store)
+                        .response_headers(true)
+                        .observe(move |event: &RateLimitEvent<'_>| {
+                            callback_events.lock().unwrap().push((
+                                event.outcome,
+                                event.error_kind,
+                                event.metadata,
+                            ));
+                        }),
+                )
+                .default_service(web::to(|| async { HttpResponse::Ok().finish() })),
+        )
+        .await;
+        let response = test::call_service(&app, test::TestRequest::get().to_request()).await;
+        let (outcome, status) = match policy {
+            FailurePolicy::FailOpen => (RateLimitOutcome::FailOpen, StatusCode::OK),
+            FailurePolicy::FailClosed => (
+                RateLimitOutcome::StoreError,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        };
+        assert_eq!(response.status(), status);
+        assert!(!response.headers().contains_key("ratelimit"));
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            &[(outcome, Some(RateLimitErrorKind::Backend), None)]
+        );
+        assert_eq!(server.counters.checks.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[actix_web::test]
 async fn detailed_timeouts_keep_fail_open_and_fail_closed_semantics() {
     for policy in [FailurePolicy::FailOpen, FailurePolicy::FailClosed] {
         let server = Server::start(Scenario::DelayedResult).await;

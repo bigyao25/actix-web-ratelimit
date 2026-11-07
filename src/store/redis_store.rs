@@ -159,11 +159,12 @@ impl RedisStore {
                     retry_after: Some(Duration::from_micros(retry)),
                 }),
             }),
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
+            // A syntactically valid but inconsistent Lua reply is a backend
+            // protocol error, not a network/connection failure.
+            _ => Err(RedisError::from((
+                redis::ErrorKind::UnexpectedReturnType,
                 "invalid Redis rate limit metadata",
-            )
-            .into()),
+            ))),
         }
     }
 
