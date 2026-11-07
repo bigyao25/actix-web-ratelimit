@@ -1,6 +1,26 @@
 use crate::config::RateLimitConfig;
 use futures_util::future::BoxFuture;
-use std::{error::Error, fmt, sync::Arc};
+use std::{error::Error, fmt, sync::Arc, time::Duration};
+
+/// The result of one atomic admission, optionally including a quota snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateLimitDecision {
+    pub allowed: bool,
+    /// Absent when a store cannot provide a reliable snapshot (including fail-open).
+    pub metadata: Option<RateLimitMetadata>,
+}
+
+/// Quota state immediately after checking and, if allowed, recording this request.
+/// Concurrent requests can consume the remaining quota before it is used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateLimitMetadata {
+    /// Available quota after admitting the current request; the `r` header parameter.
+    /// This snapshot does not reserve quota for future requests.
+    pub remaining: usize,
+    /// Earliest retry delay for a rejected request, assuming no competing admissions.
+    /// `None` for admitted requests, unknown delays, or a permanently zero quota.
+    pub retry_after: Option<Duration>,
+}
 
 /// An invalid configuration or an unavailable storage backend.
 #[derive(Debug)]
@@ -52,6 +72,28 @@ pub trait RateLimitStore: Send + Sync {
         key: &'a str,
         config: &'a RateLimitConfig,
     ) -> BoxFuture<'a, Result<bool, StoreError>>;
+
+    /// Checks and records exactly once, with optional metadata from the same operation.
+    /// The default calls [`Self::is_limited`] exactly once and returns
+    /// `metadata: None`, preserving existing custom stores without inventing quota
+    /// information. Override this method to provide a snapshot atomically with
+    /// admission. `Arc` and `Box` forward both methods to the underlying store.
+    ///
+    /// Direct callers can use `store.check(key, &config).await?` to obtain a
+    /// [`RateLimitDecision`] with optional [`RateLimitMetadata`]. Call this OR
+    /// `is_limited` for a request; calling both performs admission twice.
+    fn check<'a>(
+        &'a self,
+        key: &'a str,
+        config: &'a RateLimitConfig,
+    ) -> BoxFuture<'a, Result<RateLimitDecision, StoreError>> {
+        Box::pin(async move {
+            Ok(RateLimitDecision {
+                allowed: !self.is_limited(key, config).await?,
+                metadata: None,
+            })
+        })
+    }
 }
 
 impl<T: RateLimitStore + ?Sized> RateLimitStore for Box<T> {
@@ -62,6 +104,14 @@ impl<T: RateLimitStore + ?Sized> RateLimitStore for Box<T> {
     ) -> BoxFuture<'a, Result<bool, StoreError>> {
         (**self).is_limited(key, config)
     }
+
+    fn check<'a>(
+        &'a self,
+        key: &'a str,
+        config: &'a RateLimitConfig,
+    ) -> BoxFuture<'a, Result<RateLimitDecision, StoreError>> {
+        (**self).check(key, config)
+    }
 }
 
 impl<T: RateLimitStore + ?Sized> RateLimitStore for Arc<T> {
@@ -71,5 +121,13 @@ impl<T: RateLimitStore + ?Sized> RateLimitStore for Arc<T> {
         config: &'a RateLimitConfig,
     ) -> BoxFuture<'a, Result<bool, StoreError>> {
         (**self).is_limited(key, config)
+    }
+
+    fn check<'a>(
+        &'a self,
+        key: &'a str,
+        config: &'a RateLimitConfig,
+    ) -> BoxFuture<'a, Result<RateLimitDecision, StoreError>> {
+        (**self).check(key, config)
     }
 }

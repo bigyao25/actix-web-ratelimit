@@ -43,10 +43,26 @@ fn main() {
         }
         let elapsed = start.elapsed();
         assert_eq!(allowed, old_allowed);
+        let detailed_store = MemoryStore::new();
+        let start = Instant::now();
+        let mut detailed_allowed = 0;
+        for i in 0..REQUESTS {
+            let decision = black_box(
+                detailed_store
+                    .check(&keys[i % clients], &config)
+                    .now_or_never()
+                    .unwrap()
+                    .unwrap(),
+            );
+            detailed_allowed += usize::from(decision.allowed);
+        }
+        let detailed_elapsed = start.elapsed();
+        assert_eq!(detailed_allowed, allowed);
         println!(
-            "clients={clients} requests={REQUESTS} admitted={allowed} vec_retain_ns_per_check={:.0} queue_ns_per_check={:.0}",
+            "clients={clients} requests={REQUESTS} admitted={allowed} vec_retain_ns_per_check={:.0} queue_ns_per_check={:.0} detailed_ns_per_check={:.0}",
             old_elapsed.as_nanos() as f64 / REQUESTS as f64,
-            elapsed.as_nanos() as f64 / REQUESTS as f64
+            elapsed.as_nanos() as f64 / REQUESTS as f64,
+            detailed_elapsed.as_nanos() as f64 / REQUESTS as f64
         );
     }
 }

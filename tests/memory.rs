@@ -136,3 +136,55 @@ fn concurrent_sweeps_preserve_active_quotas() {
         assert_eq!(count.load(Ordering::SeqCst), 50);
     }
 }
+
+#[test]
+fn concurrent_detailed_checks_return_atomic_post_admission_snapshots() {
+    let store = Arc::new(MemoryStore::new());
+    let barrier = Arc::new(Barrier::new(32));
+    let handles: Vec<_> = (0..32)
+        .map(|_| {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                store
+                    .check("shared", &RateLimitConfig::default().max_requests(7))
+                    .now_or_never()
+                    .unwrap()
+                    .unwrap()
+            })
+        })
+        .collect();
+    let mut remaining = Vec::new();
+    for handle in handles {
+        let decision = handle.join().unwrap();
+        let metadata = decision.metadata.unwrap();
+        if decision.allowed {
+            remaining.push(metadata.remaining);
+            assert_eq!(metadata.retry_after, None);
+        } else {
+            assert_eq!(metadata.remaining, 0);
+            assert!(metadata.retry_after.unwrap() <= std::time::Duration::from_secs(100));
+        }
+    }
+    remaining.sort_unstable();
+    assert_eq!(remaining, (0..7).collect::<Vec<_>>());
+}
+
+#[actix_web::test]
+async fn detailed_and_basic_checks_share_state_and_validate_the_same_config() {
+    let store = MemoryStore::new();
+    let config = RateLimitConfig::default().max_requests(2);
+    assert!(!store.is_limited("a", &config).await.unwrap());
+    let decision = store.check("a", &config).await.unwrap();
+    assert!(decision.allowed);
+    assert_eq!(decision.metadata.unwrap().remaining, 0);
+    assert!(store.is_limited("a", &config).await.unwrap());
+    assert!(!store.check("a", &config).await.unwrap().allowed);
+    assert!(
+        store
+            .check("a", &config.clone().window_secs(0))
+            .await
+            .is_err()
+    );
+}
