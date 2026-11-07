@@ -238,11 +238,10 @@ impl RateLimitConfig {
     ///             ))
     ///     });
     ///
-    /// // Custom headers and retry-after
+    /// // Custom limit headers. Use RateLimit::response_headers(true) for an accurate Retry-After.
     /// let config = RateLimitConfig::default()
     ///     .exceeded(|_id, config, _req| {
     ///         HttpResponse::TooManyRequests()
-    ///             .append_header(("Retry-After", config.window_secs.as_secs()))
     ///             .append_header(("X-RateLimit-Limit", config.max_requests))
     ///             .body("Rate limit exceeded. Please try again later.")
     ///     });
