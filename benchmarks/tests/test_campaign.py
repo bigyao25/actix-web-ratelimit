@@ -188,3 +188,24 @@ class WorkflowTest(unittest.TestCase):
             self.assertEqual([x['platforms'] for x in index['shards']],[['memory'],['redis']])
             (root/'benchmark-diagnostics-redis/status.json').unlink()
             self.assertFalse(workflow.aggregate(root,'compare')[0]['complete'])
+
+    def test_environment_inconclusive_is_reported_not_falsely_qualified(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            for name in ('memory','redis'):
+                folder=root/('benchmark-diagnostics-'+name);folder.mkdir()
+                (folder/'status.json').write_text(json.dumps({'outcome':'success'}))
+                (folder/'environment.json').write_text(json.dumps({'git_sha':'sha'}))
+                (folder/'raw.json').write_text(json.dumps({'rounds':[] if name=='memory' else
+                    [row('head',platform_id='redis-host')]}))
+                (folder/'verdicts.json').write_text(json.dumps({'capacity':[],'costs':[],'boundaries':[]}))
+                (folder/'assessment.md').write_text('# Benchmark assessment')
+                (folder/'result-classification.json').write_text(json.dumps({
+                    'status':'inconclusive_environment' if name=='memory' else 'completed'}))
+                (folder/'campaign-plan.json').write_text(json.dumps({'environment_unresolved':
+                    [{'reason':'generator never sustained a preflight'}] if name=='memory' else []}))
+            index,content=workflow.aggregate(root,'compare')
+            self.assertTrue(index['complete'])
+            self.assertIn('Inconclusive',content)
+            self.assertEqual(index['shards'][0]['verification'],'inconclusive_environment')
+            self.assertNotIn('sustained-load evidence (each:',content.lower())

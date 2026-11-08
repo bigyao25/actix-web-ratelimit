@@ -15,6 +15,7 @@ import verdicts
 import capacity
 import workloads
 import highlights
+import recovery
 
 HERE=Path(__file__).resolve().parent
 PEERS=['baseline','head','governor','trypema','extensible']
@@ -105,52 +106,104 @@ def main():
                              max_confirmation_rounds=(len(cases)+1)*len(peers)*repeats,
                              max_confirmation_load_seconds=(len(cases)+1)*len(peers)*repeats*(seconds+warmup),
                              max_short_rounds=short_rounds,
-                             note='Upper bounds, not scheduled counts. Builds/startup/diagnostics/short probes are additional; extra reject sampling may be longer. One cold build; later phases verify provenance.'),indent=2));return
+                             recovery=dict(max_downshifts=0 if a.check else 2,factor=.8,
+                                           preflight_repeats=0 if a.check else 1,
+                                           preflight_measurement_seconds=0 if a.check else 30),
+                             note='Bounds exclude preflight, recovery attempts, builds and startup. Failed attempts are retained but never qualified.'),indent=2));return
     if a.output.exists() and any(child.name!='run.log' for child in a.output.iterdir()):
         p.error('Use a fresh campaign output directory; old results must not be reused')
     a.output.mkdir(parents=True,exist_ok=True)
     children=[];status='failure';trace=[];issues=[];coverage=[]
+    environment_recoveries=[];environment_unresolved=[];plan=[];details={}
+    classification=dict(status='failure',blocking=['campaign did not complete'],peer_exclusions=[])
     manifest=None
     def interrupted(*_): raise KeyboardInterrupt()
     signal.signal(signal.SIGTERM,interrupted)
-    def execute(name,stage,selected,levels,seconds,warmup,repeats,clients=1,mode='allow',record=True):
+
+    def save_plan():
+        (a.output/'campaign-plan.json').write_text(json.dumps(dict(
+            confirmations=plan,refinement_trace=trace,resolution_rps=resolution,
+            coverage_cases=coverage,issues=issues,environment_recoveries=environment_recoveries,
+            environment_unresolved=environment_unresolved,**details),indent=2))
+
+    def execute(name,stage,selected,levels,duration,prewarm,repetitions,
+                clients=1,mode='allow',record=True):
         nonlocal manifest
         child=a.output/name
-        if record: children.append((child,stage))
         cmd=[sys.executable,str(HERE/'bench.py'),'compare','--backends',a.backend,
-             '--variants',*selected,'--rates',*map(str,levels),'--duration',str(seconds),
-             '--warmup',str(warmup),'--repeats',str(repeats),'--output',str(child)]
-        cmd += ['--clients',str(clients),'--modes',mode]
-        if manifest: cmd += ['--reuse-build-manifest',str(manifest)]
+             '--variants',*selected,'--rates',*map(str,levels),'--duration',str(duration),
+             '--warmup',str(prewarm),'--repeats',str(repetitions),'--output',str(child)]
+        cmd+=['--clients',str(clients),'--modes',mode]
+        if manifest: cmd+=['--reuse-build-manifest',str(manifest)]
         if a.allow_dirty: cmd.append('--allow-dirty')
-        # The first phase builds; later phases verify exact source and image provenance.
         process=subprocess.Popen(cmd)
         try:
-            if process.wait(): raise RuntimeError('Benchmark phase failed: '+name)
+            code=process.wait()
         finally:
             if process.poll() is None:
                 process.terminate()
                 try: process.wait(timeout=15)
                 except subprocess.TimeoutExpired: process.kill();process.wait()
-        if manifest is None: manifest=child/'environment.json'
-        return json.loads((child/'raw.json').read_text())['rounds']
-    def probe_quietly(name,levels):
-        """Short probe that tolerates the invalid-baseline abort.
+        metadata=child/'environment.json'
+        if manifest is None and metadata.exists() and json.loads(metadata.read_text()).get('images'):
+            manifest=metadata
+        raw=child/'raw.json'
+        rows=json.loads(raw.read_text())['rounds'] if raw.exists() else []
+        if code==recovery.SCHEDULER_EXIT:
+            recovery.inspect(rows,repetitions,report.validate,exit_code=code)
+            raise recovery.SchedulerAbort(rows)
+        if code:
+            raise RuntimeError(f'Benchmark phase {name} failed with exit code {code}')
+        if record: children.append((child,stage))
+        return rows
 
-        Every peer is selected so this phase builds all images; the main probe
-        phase reuses that manifest and would otherwise fail on a missing image.
-        Only baseline rows drive the ladder decision.
-        """
-        nonlocal manifest
-        try: return execute(name,'probe',peers,levels,probe_seconds,2,1,record=False)
-        except RuntimeError:
-            raw=a.output/name/'raw.json';env=a.output/name/'environment.json'
-            # Reuse the build only when images were actually recorded; otherwise rebuild.
-            manifest=env if env.exists() and json.loads(env.read_text()).get('images') else None
-            return json.loads(raw.read_text())['rounds'] if raw.exists() else []
+    def probe_quietly(name,levels,record=False,clients=1,mode='allow',duration=None):
+        """Ignore only attributable generator loss; never suppress other failures."""
+        duration=probe_seconds if duration is None else duration
+        try:
+            rows=execute(name,'probe',peers,levels,duration,1 if a.check else 2,1,
+                         clients,mode,record=False)
+            issue=recovery.inspect(rows,1,report.validate)
+        except recovery.SchedulerAbort as abort:
+            rows=abort.rows
+            issue=recovery.inspect(rows,1,report.validate,exit_code=recovery.SCHEDULER_EXIT)
+        if issue:
+            environment_recoveries.append(dict(phase='probe',source_run=name,
+                rate=levels[-1],issue=issue,excluded_from_verdicts=True))
+            save_plan()
+            return rows if not record else []
+        if record: children.append((a.output/name,'probe'))
+        return rows
+
+    def confirm_with_recovery(name,rate,selected,clients=1,mode='allow',duration=None):
+        duration=seconds if duration is None else duration
+        accepted_child=[None]
+        def preflight(offered,attempt):
+            return execute(f'{name}-preflight-{attempt}-{offered}','diagnostic',
+                           ['baseline','head'],[offered],30,5,1,clients,mode,record=False)
+        def confirm(offered,attempt):
+            child=f'{name}-trial-{attempt}-{offered}'
+            rows=execute(child,'confirm',selected,[offered],duration,warmup,repeats,
+                         clients,mode,record=False)
+            accepted_child[0]=a.output/child
+            return rows
+        confirmed,_,events=recovery.confirm_at_safe_rate(
+            rate,None if a.check else preflight,confirm,report.validate,
+            confirmation_repeats=repeats,max_downshifts=0 if a.check else 2)
+        for event in events:
+            environment_recoveries.append(dict(source_run=name,clients=clients,mode=mode,**event))
+        if confirmed is None:
+            environment_unresolved.append(dict(source_run=name,rate=rate,clients=clients,
+                                               mode=mode,reason='exhausted bounded generator recovery'))
+            save_plan()
+            return None
+        children.append((accepted_child[0],'confirm'))
+        collect(a.output,children,a.check)
+        save_plan()
+        return confirmed
+
     try:
         calibration=dict(initial=list(rates),steps=[],adjusted=False)
-        # Explicit --probe-rates are honoured; only the default ladder self-calibrates.
         if not a.check and a.probe_rates is None:
             for step in range(capacity.LOADGEN_STEPS):
                 observed=probe_quietly('calibrate-'+str(step),[rates[-1]])
@@ -160,61 +213,113 @@ def main():
                 rates=decision['rates']
         calibration['final']=list(rates)
         calibration['adjusted']=rates!=calibration['initial']
-        anchor=execute('probe','probe',peers,rates,probe_seconds,1 if a.check else 2,1)
+        anchor=[]
+        for rate in rates:
+            anchor+=probe_quietly('probe-'+str(rate),[rate],record=True)
         for i in range(0 if a.check else a.refine_budget):
-            decision=capacity.next_probe(anchor,peers,resolution)
+            decision=capacity.next_probe(anchor,peers,resolution) if anchor else None
             if decision is None: break
             trace.append(decision)
-            anchor += execute('refine-'+str(i),'probe',peers,[decision['rate']],probe_seconds,2,1)
+            anchor+=probe_quietly('refine-'+str(i),[decision['rate']],record=True)
         collect(a.output,children,a.check)
         plan,details=confirmation_plan(anchor,a.backend,peers)
         details['calibration']=calibration
-        details['search_status']=capacity.search_status(anchor,peers,resolution,len(trace),0 if a.check else a.refine_budget,a.check)
-        def save_plan():
-            (a.output/'campaign-plan.json').write_text(json.dumps(dict(confirmations=plan,refinement_trace=trace,
-                resolution_rps=resolution,coverage_cases=coverage,issues=issues,**details),indent=2))
+        details['search_status']=capacity.search_status(anchor,peers,resolution,len(trace),
+                                                        0 if a.check else a.refine_budget,a.check)
         save_plan()
-        if not plan: raise RuntimeError('No confirmation plan: inspect probe diagnostics')
-        for cell in plan:
-            execute('confirm-'+str(cell['rate']),'confirm',cell['variants'],[cell['rate']],seconds,warmup,repeats)
-            collect(a.output,children,a.check)
-        # Compare cardinality and response paths at one conservative shared offered level.
-        reference=details['common_probe_rate'] or min(details['probe_candidates'].values())
-        rate=max(5000,round(reference*.8/500)*500) if not a.check else rates[0]
-        for case in cases:
-            clients,mode=case['clients'],case['mode']
-            if clients==1 and mode=='allow': continue
-            offered=rate;name=f'{clients}-{mode}'
-            for attempt in range(2):
-                duration=min(60,max(probe_seconds,math.ceil(clients*10/offered))) if mode=='reject' else probe_seconds
-                observed=execute('survey-'+name+'-'+str(attempt),'probe',peers,[offered],duration,1 if a.check else 2,1,clients,mode)
-                if all(verdicts.passed(r) for r in observed) or attempt==1: break
-                fallback=max(5000,round(offered/1000)*500)
-                if fallback==offered: break
-                offered=fallback
-            eligible=[r['variant'] for r in observed if not report.validate(r) and not workloads.coverage_failures(r)]
-            skipped=sorted(set(peers)-set(eligible))
-            entry=dict(clients=clients,mode=mode,rate=offered,variants=eligible,skipped=skipped)
-            coverage.append(entry);save_plan()
-            if skipped: issues.append(dict(case=name,reason='Invalid measurement or required response/cardinality coverage missing',variants=skipped))
+        if not plan and not environment_recoveries:
+            raise RuntimeError('No confirmation plan: inspect probe diagnostics')
+        if not plan:
+            environment_unresolved.append(dict(source_run='probe',rate=max(rates),
+                reason='no reliable HEAD/baseline probe bracket after generator loss'))
             save_plan()
-            if not {'baseline','head'}<=set(eligible):
-                issues.append(dict(case=name,reason='No usable baseline/HEAD pair; long repeats skipped'));save_plan();continue
-            if not any(r['variant']!='baseline' and verdicts.passed(r) for r in observed):
-                issues.append(dict(case=name,reason='No passing implementation after fallback; long repeats skipped'));save_plan();continue
-            duration=min(60,max(seconds,math.ceil(clients*10/offered))) if mode=='reject' else seconds
-            execute('coverage-'+name,'confirm',eligible,[offered],duration,warmup,repeats,clients,mode)
-            collect(a.output,children,a.check)
-        save_plan()
+        else:
+            confirmed_rates=set()
+            for cell in plan:
+                intended=cell['rate']
+                if intended in confirmed_rates:
+                    continue
+                actual=confirm_with_recovery('confirm-'+str(intended),intended,cell['variants'])
+                if actual is not None: confirmed_rates.add(actual)
+            # Compare cardinality and response paths at one conservative shared level.
+            reference=details['common_probe_rate'] or min(details['probe_candidates'].values())
+            if confirmed_rates:
+                reference=min(reference,max(confirmed_rates))
+            rate=max(5000,round(reference*.8/500)*500) if not a.check else rates[0]
+            for case in cases:
+                clients,mode=case['clients'],case['mode']
+                if clients==1 and mode=='allow': continue
+                offered=rate;name=f'{clients}-{mode}'
+                observed=[]
+                for attempt in range(2):
+                    duration=min(60,max(probe_seconds,math.ceil(clients*10/offered))) if mode=='reject' else probe_seconds
+                    observed=probe_quietly(f'survey-{name}-{attempt}',[offered],record=True,
+                                            clients=clients,mode=mode,duration=duration)
+                    if not observed:
+                        offered=recovery.lower_rate(offered) or offered
+                        continue
+                    if all(verdicts.passed(r) for r in observed): break
+                    fallback=max(5000,round(offered/1000)*500)
+                    if fallback==offered: break
+                    offered=fallback
+                if not observed:
+                    environment_unresolved.append(dict(source_run='survey-'+name,
+                        rate=offered,clients=clients,mode=mode,
+                        reason='no reliable HEAD/baseline survey after generator loss'))
+                    save_plan();continue
+                eligible=[r['variant'] for r in observed if not report.validate(r)
+                          and not workloads.coverage_failures(r)]
+                skipped=sorted(set(peers)-set(eligible))
+                coverage.append(dict(clients=clients,mode=mode,rate=offered,
+                                     variants=eligible,skipped=skipped))
+                if skipped:
+                    issues.append(dict(case=name,reason='Invalid measurement or required response/cardinality coverage missing',variants=skipped))
+                save_plan()
+                if not {'baseline','head'}<=set(eligible):
+                    issues.append(dict(case=name,reason='No usable baseline/HEAD pair; long repeats skipped'))
+                    save_plan();continue
+                if not any(r['variant']!='baseline' and verdicts.passed(r) for r in observed):
+                    issues.append(dict(case=name,reason='No passing implementation after fallback; long repeats skipped'))
+                    save_plan();continue
+                duration=min(60,max(seconds,math.ceil(clients*10/offered))) if mode=='reject' else seconds
+                confirm_with_recovery('coverage-'+name,offered,eligible,clients,mode,duration)
         rows=collect(a.output,children,a.check)
-        status, blocking, peer_exclusions = highlights.classify_campaign(rows, issues, report.validate)
-        (a.output/'result-classification.json').write_text(json.dumps(dict(
-            status=status, blocking=blocking, peer_exclusions=peer_exclusions), indent=2))
+        base_status,blocking,peer_exclusions=highlights.classify_campaign(rows,issues,report.validate)
+        if blocking and not (environment_unresolved and
+                             all(item in ('no measurements','no HEAD/baseline measurements')
+                                 for item in blocking)):
+            status='measurement_failure'
+        elif environment_unresolved:
+            status='inconclusive_environment'
+        elif environment_recoveries:
+            status='completed_with_environment_limits'
+        else:
+            status=base_status
+        if a.check and environment_unresolved:
+            status='measurement_failure'
+        classification=dict(status=status,blocking=blocking,
+                            peer_exclusions=peer_exclusions,
+                            environment_recoveries=environment_recoveries,
+                            environment_unresolved=environment_unresolved)
+    except Exception as error:
+        classification=dict(status='failure',blocking=[str(error)],peer_exclusions=[],
+                            environment_recoveries=environment_recoveries,
+                            environment_unresolved=environment_unresolved)
+        raise
     finally:
         collect(a.output,children,a.check)
+        # Preserve runner provenance even if every candidate was excluded.
+        if manifest and not (a.output/'environment.json').exists():
+            env=json.loads(manifest.read_text())
+            env['campaign']=dict(same_host=True,operational_check=a.check,
+                                 plan=json.loads((a.output/'campaign-plan.json').read_text())
+                                 if (a.output/'campaign-plan.json').exists() else {})
+            (a.output/'environment.json').write_text(json.dumps(env,indent=2))
+        (a.output/'result-classification.json').write_text(json.dumps(classification,indent=2))
         (a.output/'assessment.md').write_text(summary.render(a.output,status))
-    if status not in ('completed', 'completed_with_peer_exclusions'):
-        raise SystemExit('Campaign incomplete or invalid; inspect workload coverage, bounds and diagnostics')
+    if status not in ('completed','completed_with_peer_exclusions',
+                      'completed_with_environment_limits','inconclusive_environment'):
+        raise SystemExit('Campaign failed: inspect result-classification.json')
 
 
 if __name__=='__main__': main()

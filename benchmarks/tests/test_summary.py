@@ -31,6 +31,14 @@ class SummaryTest(unittest.TestCase):
         self.assertIn('loadgen pressure',summary.assess({**self.fixture(),'loadgen_cpu_limit':.5,'loadgen_cpu_pct':49,'loadgen_saturated':True}))
         self.assertEqual(summary.assess(self.fixture()),'no bottleneck demonstrated')
 
+    def test_success_step_resolves_inconclusive_environment_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder=Path(tmp)
+            (folder/'result-classification.json').write_text(json.dumps({
+                'status':'inconclusive_environment'}))
+            self.assertEqual(summary.resolve_status(folder,'success'),'inconclusive_environment')
+            self.assertEqual(summary.resolve_status(folder,'failure'),'failure')
+
     def test_smoke_summary_contains_qualifiers_and_artifact(self):
         with tempfile.TemporaryDirectory() as tmp:
             folder=Path(tmp)

@@ -12,6 +12,15 @@ import workloads
 import highlights
 
 
+def resolve_status(folder, status):
+    if status != 'success':
+        return status
+    path=folder/'result-classification.json'
+    if path.exists():
+        return json.loads(path.read_text()).get('status',status)
+    return status
+
+
 def expected_historical(round_):
     reasons=report.validate(round_)
     return round_.get('variant')=='v0.1.2' and bool(reasons) and set(reasons)<={'correctness_mismatch','quota_exceeded'}
@@ -43,6 +52,7 @@ def assess(round_):
 
 
 def render(folder, status='unknown', artifact_url=''):
+    status=resolve_status(folder,status)
     raw_path=folder/'raw.json'
     env_path=folder/'environment.json'
     env=json.loads(env_path.read_text()) if env_path.exists() else {}
@@ -56,7 +66,9 @@ def render(folder, status='unknown', artifact_url=''):
     fmt=lambda v: 'N/A' if v is None else f'{v:.2f}'
     plan=env.get('campaign',{}).get('plan',{})
     executive=highlights.concise(rows, verdicts.analyze(rows), status,
-                                 plan.get('issues', []), artifact_url)
+                                 plan.get('issues', []), artifact_url,
+                                 plan.get('environment_recoveries', []),
+                                 plan.get('environment_unresolved', []))
     lines=['# Benchmark assessment','',executive,'','---','',
            '## Detailed evidence','',f'Execution status: **{esc(status)}**.',
            f'Completed rounds: **{len(rows)}**; measurement-clean: **{len(valid)}**; expected historical defects: **{len(expected)}**; other invalid: **{len(unexpected)}**.','']
@@ -201,8 +213,11 @@ def main():
                     'load_failure_reasons':report.load_failures(r)} for r in rows]
         env=json.loads(env_path.read_text()) if env_path.exists() else {}
         plan=env.get('campaign',{}).get('plan',{})
-        concise=highlights.concise(annotated, verdicts.analyze(annotated), a.status,
-                                  plan.get('issues', []), os.environ.get('BENCHMARK_ARTIFACT_URL',''))
+        concise=highlights.concise(annotated, verdicts.analyze(annotated),
+                                  resolve_status(a.folder,a.status), plan.get('issues', []),
+                                  os.environ.get('BENCHMARK_ARTIFACT_URL',''),
+                                  plan.get('environment_recoveries', []),
+                                  plan.get('environment_unresolved', []))
         with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as stream:
             stream.write(concise)
 

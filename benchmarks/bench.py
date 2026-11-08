@@ -16,6 +16,7 @@ import time
 import uuid
 import report
 import resources
+import recovery
 import summary as assessment
 import variants
 import workloads
@@ -405,6 +406,10 @@ def main():
                     (a.output/'report.md').write_text(f"Git SHA: {metadata['git_sha']}\n\nDirty/non-reproducible: {bool(dirty)}\n\n"+report.markdown(summary))
                     if report.invalid_comparison_baseline(result):
                         (a.output/'assessment.md').write_text(assessment.render(a.output,'measurement_failure'))
+                        if compare and set(report.validate(result))=={'scheduler_drops'}:
+                            print('Recoverable baseline scheduler loss; '
+                                  'campaign may retry at a lower RPS',flush=True)
+                            raise SystemExit(recovery.SCHEDULER_EXIT)
                         raise RuntimeError('Baseline measurement invalid; stopped high-load comparison before wasting further rounds. Inspect transport/scheduler diagnostics.')
     finally:
         cleanup()
