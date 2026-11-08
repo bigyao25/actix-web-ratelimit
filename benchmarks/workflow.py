@@ -28,12 +28,19 @@ def aggregate(root, suite):
         env=json.loads((folder/'environment.json').read_text()) if (folder/'environment.json').exists() else {}
         raw=json.loads((folder/'raw.json').read_text()) if (folder/'raw.json').exists() else {'rounds':[]}
         platforms=sorted({r['platform_id'] for r in raw['rounds'] if r.get('platform_id')})
-        complete=(status.get('outcome')=='success' and bool(raw['rounds']) and bool(env)
-                  and (folder/'assessment.md').exists())
+        classification_path=folder/'result-classification.json'
+        classification=json.loads(classification_path.read_text()) if classification_path.exists() else {}
+        semantic=classification.get('status')
+        environmental=semantic=='inconclusive_environment'
+        complete=(status.get('outcome')=='success' and (bool(raw['rounds']) or environmental)
+                  and bool(env) and (folder/'assessment.md').exists())
         if suite=='compare':
             complete=(complete and (folder/'verdicts.json').exists()
-                      and len(platforms)==1)
+                      and (len(platforms)==1 or (environmental and not platforms)))
+        if semantic in ('measurement_failure','failure'):
+            complete=False
         entry=dict(shard=shard,outcome=status.get('outcome','missing'),complete=complete,
+                   verification=semantic or 'unknown',
                    platforms=platforms,git_sha=env.get('git_sha'),
                    rounds=len(raw['rounds']),artifact=folder.name)
         shards.append(entry)
@@ -43,15 +50,21 @@ def aggregate(root, suite):
         plan=json.loads(plan_path.read_text()) if plan_path.exists() else {}
         verdict_path=folder/'verdicts.json'
         verdict=json.loads(verdict_path.read_text()) if verdict_path.exists() else verdicts.analyze(rows)
-        outcome='completed' if complete else 'measurement_failure'
-        if complete and any(r['invalid_reasons'] and r.get('variant') not in highlights.CORE for r in rows):
+        outcome=semantic or ('completed' if complete else 'measurement_failure')
+        if not semantic and complete and any(r['invalid_reasons'] and r.get('variant') not in highlights.CORE for r in rows):
             outcome='completed_with_peer_exclusions'
         sections += ['## '+shard.capitalize(), '',
-                     highlights.concise(rows,verdict,outcome,plan.get('issues',[])),
+                     highlights.concise(rows,verdict,outcome,plan.get('issues',[]),
+                                        recoveries=plan.get('environment_recoveries',[]),
+                                        unresolved=plan.get('environment_unresolved',[])),
                      'Artifact: `'+folder.name+'`.']
     shas={s['git_sha'] for s in shards if s['git_sha']}
     success=all(s['complete'] for s in shards) and len(shas)==1
-    status='Complete' if success else 'Incomplete — inspect failing shard'
+    incomplete_evidence=any(x['verification']=='inconclusive_environment' for x in shards)
+    status=('Incomplete — inspect failing shard' if not success else
+            'Inconclusive — one or more runner-limited shards' if incomplete_evidence else
+            'Complete with warnings' if any(x['verification'] in ('completed_with_environment_limits','completed_with_peer_exclusions') for x in shards)
+            else 'Complete')
     lines=['# Benchmark results','',f'**Run status:** {status}.',
            'Measurements from different hosted runners are **not combined or ranked**.',
            'Successful execution does not imply a performance winner or maximum throughput.',

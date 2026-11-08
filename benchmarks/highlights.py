@@ -142,15 +142,20 @@ def _cost_claim(row):
             f"(paired 95% interval {row['low']:.2f}-{row['high']:.2f}); different algorithms")
 
 
-def concise(rows, verdict, status='unknown', issues=(), artifact_url=''):
+def concise(rows, verdict, status='unknown', issues=(), artifact_url='',
+            recoveries=(), unresolved=()):
     """Short, conservative Markdown; full round-level evidence stays in artifacts."""
     lines = ['### Key findings', '']
     if not rows:
         lines += ['**No benchmark measurements available.** No performance claim can be made.']
+        if unresolved:
+            lines.append('**Inconclusive environment:** ' + str(unresolved[0].get('reason','unknown')) + '.')
         return '\n'.join(lines) + '\n'
     critical = [row for row in rows if row.get('variant') in CORE and row.get('invalid_reasons')]
     peers = [row for row in rows if row.get('variant') not in CORE and row.get('invalid_reasons')]
     quality = ('Failed / incomplete' if status in ('failure', 'measurement_failure', 'failed')
+               else 'Inconclusive — generator/runner scheduling' if status=='inconclusive_environment'
+               else 'Completed with environment-limited rates' if status=='completed_with_environment_limits'
                else 'Completed with excluded peer cells' if peers or issues
                else 'Completed' if status in ('completed', 'success')
                else str(status))
@@ -197,6 +202,13 @@ def concise(rows, verdict, status='unknown', issues=(), artifact_url=''):
         if len(peers) > 3:
             lines.append(f'- {len(peers) - 3} additional peer exclusions in diagnostics.')
         lines.append('')
+    if recoveries:
+        samples=[f"{e.get('rate', '?')} RPS ({e.get('phase','unknown')}: {e.get('issue','see diagnostics')})"
+                 for e in recoveries[-2:]]
+        lines += [f'**Load-generator recovery:** {len(recoveries)} excluded attempt(s); '+
+                  '; '.join(samples)+'. Retried at lower offered rates; failed attempts are not ranked.','']
+    if unresolved:
+        lines += [f'**Unverified coverage:** {len(unresolved)} scenario(s) remained inconclusive after bounded recovery; no capacity claim for these scenarios.','']
     if issues:
         lines.append(f'**Coverage warnings:** {len(issues)} issue(s); see campaign-plan.json for affected variants.')
         lines.append('')
