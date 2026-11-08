@@ -227,7 +227,9 @@ def main():
         details['search_status']=capacity.search_status(anchor,peers,resolution,len(trace),
                                                         0 if a.check else a.refine_budget,a.check)
         save_plan()
-        if not plan and not environment_recoveries:
+        probe_loss=any(entry.get('source_run','').startswith(('probe-','refine-'))
+                       for entry in environment_recoveries)
+        if not plan and not probe_loss:
             raise RuntimeError('No confirmation plan: inspect probe diagnostics')
         if not plan:
             environment_unresolved.append(dict(source_run='probe',rate=max(rates),
