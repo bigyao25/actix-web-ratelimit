@@ -9,6 +9,7 @@ import report
 import comparison
 import verdicts
 import workloads
+import highlights
 
 
 def expected_historical(round_):
@@ -53,7 +54,11 @@ def render(folder, status='unknown', artifact_url=''):
     load_failed=[r for r in valid if r['load_failure_reasons']]
     esc=lambda v: str(v).replace('|','\\|').replace('\n',' ').replace('`','').replace('<','&lt;')
     fmt=lambda v: 'N/A' if v is None else f'{v:.2f}'
-    lines=['# Benchmark assessment','',f'Execution status: **{esc(status)}**.',
+    plan=env.get('campaign',{}).get('plan',{})
+    executive=highlights.concise(rows, verdicts.analyze(rows), status,
+                                 plan.get('issues', []), artifact_url)
+    lines=['# Benchmark assessment','',executive,'','---','',
+           '## Detailed evidence','',f'Execution status: **{esc(status)}**.',
            f'Completed rounds: **{len(rows)}**; measurement-clean: **{len(valid)}**; expected historical defects: **{len(expected)}**; other invalid: **{len(unexpected)}**.','']
     quality='no data' if not rows else 'historical defect reproduced' if len(expected)==len(rows) else 'failed' if not valid else 'partial' if unexpected else 'clean'
     lines += [f'Measurement quality: **{quality}**. Clean rounds failing load criteria: **{len(load_failed)}**. Execution success alone does not qualify a workload.','']
@@ -189,8 +194,17 @@ def main():
     a.output.parent.mkdir(parents=True,exist_ok=True)
     a.output.write_text(content)
     if a.github_summary and os.environ.get('GITHUB_STEP_SUMMARY'):
+        raw_path=a.folder/'raw.json'
+        env_path=a.folder/'environment.json'
+        rows=json.loads(raw_path.read_text()).get('rounds',[]) if raw_path.exists() else []
+        annotated=[{**r, 'invalid_reasons':report.validate(r),
+                    'load_failure_reasons':report.load_failures(r)} for r in rows]
+        env=json.loads(env_path.read_text()) if env_path.exists() else {}
+        plan=env.get('campaign',{}).get('plan',{})
+        concise=highlights.concise(annotated, verdicts.analyze(annotated), a.status,
+                                  plan.get('issues', []), os.environ.get('BENCHMARK_ARTIFACT_URL',''))
         with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as stream:
-            stream.write(content[:200000])
+            stream.write(concise)
 
 
 if __name__=='__main__':

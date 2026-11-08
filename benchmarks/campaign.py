@@ -14,6 +14,7 @@ import variants
 import verdicts
 import capacity
 import workloads
+import highlights
 
 HERE=Path(__file__).resolve().parent
 PEERS=['baseline','head','governor','trypema','extensible']
@@ -206,13 +207,14 @@ def main():
             collect(a.output,children,a.check)
         save_plan()
         rows=collect(a.output,children,a.check)
-        status='completed'
-        if issues or any(report.validate(r) for r in rows):
-            status='measurement_failure'
+        status, blocking, peer_exclusions = highlights.classify_campaign(rows, issues, report.validate)
+        (a.output/'result-classification.json').write_text(json.dumps(dict(
+            status=status, blocking=blocking, peer_exclusions=peer_exclusions), indent=2))
     finally:
         collect(a.output,children,a.check)
         (a.output/'assessment.md').write_text(summary.render(a.output,status))
-    if status!='completed': raise SystemExit('Campaign incomplete or invalid; inspect workload coverage, bounds and diagnostics')
+    if status not in ('completed', 'completed_with_peer_exclusions'):
+        raise SystemExit('Campaign incomplete or invalid; inspect workload coverage, bounds and diagnostics')
 
 
 if __name__=='__main__': main()
