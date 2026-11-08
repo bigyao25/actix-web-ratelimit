@@ -1,6 +1,6 @@
 [package]
 name = "actix-web-ratelimit"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 rust-version = "1.89"
 authors = ["bigyao25 <rungroo@gmail.com>"]
@@ -8,7 +8,16 @@ description = "A simple and highly customizable rate limiter for actix-web 4"
 license = "MIT"
 repository = "https://github.com/bigyao25/actix-web-ratelimit"
 readme = "README.md"
-include = ["src/**", "examples/**", "tests/**", "benches/**", "Cargo.toml", "Cargo.lock", "README*.md", "LICENSE"]
+include = [
+  "src/**",
+  "examples/**",
+  "tests/**",
+  "benches/**",
+  "Cargo.toml",
+  "Cargo.lock",
+  "README*.md",
+  "LICENSE",
+]
 keywords = ["ratelimit", "rate", "limit", "actix", "actix-web"]
 categories = ["security", "web-programming"]
 
@@ -18,7 +27,11 @@ actix-service = "2"
 log = "0.4"
 futures-util = "0.3"
 dashmap = "6"
-redis = { version = "1.8", optional = true, default-features = false, features = ["tokio-comp", "connection-manager", "script"] }
+redis = { version = "1.8", optional = true, default-features = false, features = [
+  "tokio-comp",
+  "connection-manager",
+  "script",
+] }
 tokio = { version = "1", optional = true, features = ["time"] }
 
 [features]
@@ -26,7 +39,13 @@ default = ["redis"]
 redis = ["dep:redis", "dep:tokio"]
 
 [dev-dependencies]
-tokio = { version = "1", features = ["net", "io-util", "sync", "macros", "time"] }
+tokio = { version = "1", features = [
+  "net",
+  "io-util",
+  "sync",
+  "macros",
+  "time",
+] }
 
 [[bench]]
 name = "memory"

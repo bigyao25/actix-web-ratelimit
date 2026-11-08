@@ -20,6 +20,8 @@ use tokio::{
 #[derive(Clone, Copy)]
 enum Scenario {
     Healthy,
+    Limited,
+    BackendError,
     RejectPing,
     RejectScript,
     NoScriptOnce,
@@ -105,6 +107,9 @@ impl Server {
                                     b"EVALSHA" => {
                                         let check = stats.checks.fetch_add(1, Ordering::SeqCst);
                                         match scenario {
+                                            Scenario::Limited if args.last().is_some_and(|arg| arg == b"details") => b"*3\r\n:1\r\n:0\r\n:750000\r\n",
+                                            Scenario::Limited => b":1\r\n",
+                                            Scenario::BackendError => b"-ERR private backend message\r\n",
                                             Scenario::NoScriptOnce if check == 0 => b"-NOSCRIPT cache entry missing\r\n",
                                             Scenario::InvalidResult => b"$4\r\noops\r\n",
                                             Scenario::Metadata(reply) => reply,
@@ -332,6 +337,56 @@ async fn malformed_metadata_follows_failure_policy_without_fabricating_quota() {
 }
 
 #[actix_web::test]
+async fn semantic_metadata_errors_are_reported_as_backend_not_connection() {
+    use actix_web::{App, HttpResponse, http::StatusCode, test, web};
+    use actix_web_ratelimit::{
+        RateLimit,
+        observability::{RateLimitErrorKind, RateLimitEvent, RateLimitOutcome},
+    };
+    use std::sync::Mutex;
+
+    // Valid RESP array, but an impossible rejected decision: remaining != 0.
+    const INVALID_METADATA: &[u8] = b"*3\r\n:1\r\n:1\r\n:0\r\n";
+    for policy in [FailurePolicy::FailOpen, FailurePolicy::FailClosed] {
+        let server = Server::start(Scenario::Metadata(INVALID_METADATA)).await;
+        let store = server.store(policy, Duration::from_secs(1)).await;
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let callback_events = events.clone();
+        let app = test::init_service(
+            App::new()
+                .wrap(
+                    RateLimit::new(RateLimitConfig::default(), store)
+                        .response_headers(true)
+                        .observe(move |event: &RateLimitEvent<'_>| {
+                            callback_events.lock().unwrap().push((
+                                event.outcome,
+                                event.error_kind,
+                                event.metadata,
+                            ));
+                        }),
+                )
+                .default_service(web::to(|| async { HttpResponse::Ok().finish() })),
+        )
+        .await;
+        let response = test::call_service(&app, test::TestRequest::get().to_request()).await;
+        let (outcome, status) = match policy {
+            FailurePolicy::FailOpen => (RateLimitOutcome::FailOpen, StatusCode::OK),
+            FailurePolicy::FailClosed => (
+                RateLimitOutcome::StoreError,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        };
+        assert_eq!(response.status(), status);
+        assert!(!response.headers().contains_key("ratelimit"));
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            &[(outcome, Some(RateLimitErrorKind::Backend), None)]
+        );
+        assert_eq!(server.counters.checks.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[actix_web::test]
 async fn detailed_timeouts_keep_fail_open_and_fail_closed_semantics() {
     for policy in [FailurePolicy::FailOpen, FailurePolicy::FailClosed] {
         let server = Server::start(Scenario::DelayedResult).await;
@@ -346,4 +401,123 @@ async fn detailed_timeouts_keep_fail_open_and_fail_closed_semantics() {
             FailurePolicy::FailClosed => assert!(result.is_err()),
         }
     }
+}
+
+#[actix_web::test]
+async fn observed_redis_paths_report_real_outcomes_without_extra_commands() {
+    use actix_web::{App, HttpResponse, http::StatusCode, test, web};
+    use actix_web_ratelimit::{
+        RateLimit,
+        observability::{RateLimitErrorKind, RateLimitEvent, RateLimitOutcome},
+    };
+    use std::sync::Mutex;
+
+    for headers in [false, true] {
+        for policy in [FailurePolicy::FailOpen, FailurePolicy::FailClosed] {
+            for scenario in [
+                Scenario::Healthy,
+                Scenario::Limited,
+                Scenario::BackendError,
+                Scenario::InvalidResult,
+                Scenario::DelayedResult,
+                Scenario::DropFirstCheck,
+                Scenario::NoScriptOnce,
+            ] {
+                let server = Server::start(scenario).await;
+                let store = server.store(policy, Duration::from_millis(50)).await;
+                // Exercise both forwarding implementations around a real RedisStore.
+                let store: Arc<Box<dyn RateLimitStore>> = Arc::new(Box::new(store));
+                let events = Arc::new(Mutex::new(Vec::new()));
+                let callback_events = events.clone();
+                let app = test::init_service(
+                    App::new()
+                        .wrap(
+                            RateLimit::new(RateLimitConfig::default(), store)
+                                .response_headers(headers)
+                                .observe(move |event: &RateLimitEvent<'_>| {
+                                    callback_events.lock().unwrap().push((
+                                        event.outcome,
+                                        event.error_kind,
+                                        event.metadata,
+                                    ));
+                                }),
+                        )
+                        .default_service(web::to(|| async { HttpResponse::Ok().finish() })),
+                )
+                .await;
+                let response =
+                    test::call_service(&app, test::TestRequest::get().to_request()).await;
+                let failure = matches!(
+                    scenario,
+                    Scenario::BackendError
+                        | Scenario::InvalidResult
+                        | Scenario::DelayedResult
+                        | Scenario::DropFirstCheck
+                );
+                let (outcome, status) = if failure {
+                    match policy {
+                        FailurePolicy::FailOpen => (RateLimitOutcome::FailOpen, StatusCode::OK),
+                        FailurePolicy::FailClosed => (
+                            RateLimitOutcome::StoreError,
+                            StatusCode::SERVICE_UNAVAILABLE,
+                        ),
+                    }
+                } else if matches!(scenario, Scenario::Limited) {
+                    (RateLimitOutcome::Limited, StatusCode::TOO_MANY_REQUESTS)
+                } else {
+                    (RateLimitOutcome::Allowed, StatusCode::OK)
+                };
+                assert_eq!(response.status(), status);
+                assert_eq!(
+                    response.headers().contains_key("ratelimit"),
+                    headers && !failure
+                );
+                let events = events.lock().unwrap();
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0].0, outcome);
+                assert_eq!(events[0].2.is_some(), headers && !failure);
+                let kind = match scenario {
+                    Scenario::DelayedResult => Some(RateLimitErrorKind::Timeout),
+                    Scenario::DropFirstCheck => Some(RateLimitErrorKind::Connection),
+                    Scenario::BackendError | Scenario::InvalidResult => {
+                        Some(RateLimitErrorKind::Backend)
+                    }
+                    _ => None,
+                };
+                assert_eq!(events[0].1, kind);
+                let commands = if matches!(scenario, Scenario::NoScriptOnce) {
+                    2
+                } else {
+                    1
+                };
+                assert_eq!(server.counters.checks.load(Ordering::SeqCst), commands);
+                assert_eq!(server.counters.loads.load(Ordering::SeqCst), commands);
+            }
+        }
+    }
+}
+
+#[actix_web::test]
+async fn observed_zero_quota_and_invalid_config_do_not_contact_redis() {
+    let server = Server::start(Scenario::Healthy).await;
+    let store = server
+        .store(FailurePolicy::FailOpen, Duration::from_secs(1))
+        .await;
+    for metadata in [false, true] {
+        let observed = store
+            .check_observed("a", &RateLimitConfig::default().max_requests(0), metadata)
+            .await
+            .unwrap();
+        assert!(!observed.decision.allowed);
+        assert!(!observed.fail_open);
+        assert_eq!(observed.decision.metadata.is_some(), metadata);
+        assert_eq!(observed.error_kind, None);
+        assert!(
+            store
+                .check_observed("a", &RateLimitConfig::default().window_secs(0), metadata)
+                .await
+                .is_err()
+        );
+    }
+    assert_eq!(server.counters.checks.load(Ordering::SeqCst), 0);
 }

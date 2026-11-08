@@ -1,5 +1,6 @@
 use crate::{
     config::RateLimitConfig,
+    observability::ObservedRateLimitDecision,
     store::{RateLimitDecision, RateLimitMetadata, RateLimitStore, StoreError},
 };
 use dashmap::DashMap;
@@ -163,6 +164,27 @@ impl MemoryStore {
 }
 
 impl RateLimitStore for MemoryStore {
+    fn check_observed<'a>(
+        &'a self,
+        key: &'a str,
+        config: &'a RateLimitConfig,
+        metadata: bool,
+    ) -> BoxFuture<'a, Result<ObservedRateLimitDecision, StoreError>> {
+        // Reuse the synchronous admission helpers without an extra boxed future.
+        // Their bucket guards are dropped before returning to the observer.
+        Box::pin(async move {
+            let decision = if metadata {
+                self.check_detailed(key, config)?
+            } else {
+                RateLimitDecision {
+                    allowed: !self.check_limited(key, config)?,
+                    metadata: None,
+                }
+            };
+            Ok(decision.into())
+        })
+    }
+
     fn is_limited<'a>(
         &'a self,
         key: &'a str,

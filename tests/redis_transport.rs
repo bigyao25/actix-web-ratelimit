@@ -214,3 +214,63 @@ async fn initialization_is_bounded_and_rejects_invalid_options() {
     assert!(result.is_err());
     assert!(start.elapsed() < Duration::from_secs(2));
 }
+
+#[actix_web::test]
+#[ignore = "requires Redis"]
+async fn observed_real_redis_timeouts_preserve_failure_policy() {
+    use actix_web::{App, HttpResponse, http::StatusCode, test, web};
+    use actix_web_ratelimit::{
+        RateLimit,
+        observability::{RateLimitErrorKind, RateLimitEvent, RateLimitOutcome},
+    };
+    use std::sync::Mutex;
+
+    for headers in [false, true] {
+        for policy in [FailurePolicy::FailOpen, FailurePolicy::FailClosed] {
+            let proxy = Proxy::start().await;
+            let store = RedisStore::with_options(
+                &proxy.url,
+                RedisStoreOptions {
+                    timeout: Duration::from_millis(100),
+                    failure_policy: policy,
+                },
+            )
+            .await
+            .unwrap();
+            proxy.stall.notify_one();
+            proxy.stalled.notified().await;
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let callback_events = events.clone();
+            let app = test::init_service(
+                App::new()
+                    .wrap(
+                        RateLimit::new(RateLimitConfig::default(), store)
+                            .response_headers(headers)
+                            .observe(move |event: &RateLimitEvent<'_>| {
+                                callback_events.lock().unwrap().push((
+                                    event.outcome,
+                                    event.error_kind,
+                                    event.metadata,
+                                ));
+                            }),
+                    )
+                    .default_service(web::to(|| async { HttpResponse::Ok().finish() })),
+            )
+            .await;
+            let response = test::call_service(&app, test::TestRequest::get().to_request()).await;
+            let (outcome, status) = match policy {
+                FailurePolicy::FailOpen => (RateLimitOutcome::FailOpen, StatusCode::OK),
+                FailurePolicy::FailClosed => (
+                    RateLimitOutcome::StoreError,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                ),
+            };
+            assert_eq!(response.status(), status);
+            assert!(!response.headers().contains_key("ratelimit"));
+            assert_eq!(
+                *events.lock().unwrap(),
+                vec![(outcome, Some(RateLimitErrorKind::Timeout), None)]
+            );
+        }
+    }
+}

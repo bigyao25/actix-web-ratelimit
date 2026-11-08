@@ -16,6 +16,7 @@ import time
 import uuid
 import report
 import resources
+import recovery
 import summary as assessment
 import variants
 import workloads
@@ -73,6 +74,26 @@ def controlled_measurement(process, capture):
     if process.returncode or result is None or before is None or after is None:
         raise RuntimeError('Incomplete native measurement handshake')
     return result,before,after,ended-started
+
+def round_diagnostic(result, rate):
+    """One-line per-round diagnostics so a failed rate is explainable from run.log."""
+    http=result.get('http_rps',result.get('achieved_rps',0))
+    sched=result.get('scheduled_latency',{}).get('p99_ms')
+    return (f"  -> http={http:.0f}/{result.get('target_rps',rate)} "
+            f"p99={result.get('p99_ms',float('nan')):.2f}ms "
+            f"sched_p99={'n/a' if sched is None else f'{sched:.2f}ms'} "
+            f"loadgen_cpu={result.get('loadgen_cpu_pct',0):.1f}%/{result.get('loadgen_cpu_limit',1)} "
+            f"server_cpu={result.get('server_cpu_pct',0):.1f}%/{result.get('server_cpu_limit',1)} "
+            f"drop_capacity={result.get('dropped_capacity',0)} drop_late={result.get('dropped_late',0)} "
+            f"errors={result.get('errors',0)}")
+
+def generator_pressure(result):
+    """Late drops or a generator near its own quota cannot qualify a rate.
+
+    loadgen_cpu_pct is a percentage of one CPU, so the quota threshold is 85*limit.
+    """
+    return (result.get('dropped_late',0)>0
+            or result.get('loadgen_cpu_pct',0)>=85*(result.get('loadgen_cpu_limit') or 1))
 
 def verify_reuse(metadata, source, images):
     """Accept only unchanged source and the exact already-built native images."""
@@ -367,6 +388,9 @@ def main():
                                       equivalence_group='exact-log' if v in ('head','v0.2.1') else v,
                                       correctness='first-window burst oracle' if variants.VARIANTS[v]['oracle'] else 'non-equivalent policy; observations only',
                                       diagnostics=dict(before=before,after=after,cpu=cpu,samples=samples,redis=rc,containers=states))
+                        print(round_diagnostic(result,a.rate),flush=True)
+                        if generator_pressure(result):
+                            print('  !! load generator pressure: late drops or CPU near quota; this round cannot qualify a rate',flush=True)
                         rounds.append(result)
                     except Exception as error:
                         rounds.append(dict(variant=v,scenario=f'{backend}/{clients}/{concurrency}/{mode}/{rate}rps',failure=str(error)))
@@ -382,6 +406,10 @@ def main():
                     (a.output/'report.md').write_text(f"Git SHA: {metadata['git_sha']}\n\nDirty/non-reproducible: {bool(dirty)}\n\n"+report.markdown(summary))
                     if report.invalid_comparison_baseline(result):
                         (a.output/'assessment.md').write_text(assessment.render(a.output,'measurement_failure'))
+                        if compare and set(report.validate(result))=={'scheduler_drops'}:
+                            print('Recoverable baseline scheduler loss; '
+                                  'campaign may retry at a lower RPS',flush=True)
+                            raise SystemExit(recovery.SCHEDULER_EXIT)
                         raise RuntimeError('Baseline measurement invalid; stopped high-load comparison before wasting further rounds. Inspect transport/scheduler diagnostics.')
     finally:
         cleanup()

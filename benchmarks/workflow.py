@@ -5,6 +5,10 @@ import json
 import os
 from pathlib import Path
 
+import report
+import verdicts
+import highlights
+
 
 def matrix(suite):
     if suite=='compare': return {'include':[{'shard':'memory','backends':'memory'},{'shard':'redis','backends':'redis'}]}
@@ -14,32 +18,58 @@ def matrix(suite):
 
 
 def aggregate(root, suite):
+    """One short overview. Detailed round tables stay in shard artifacts."""
     shards=[]
-    lines=['# Benchmark workflow overview','',
-           'Backends run on independent hosted runners. Each shard compares every supported product and its HTTP baseline sequentially on its own host. Absolute RPS and sample distributions are never pooled across shards.','']
+    sections=[]
     for item in matrix(suite)['include']:
-        shard=item['shard'];folder=root/('benchmark-diagnostics-'+shard)
+        shard=item['shard']
+        folder=root/('benchmark-diagnostics-'+shard)
         status=json.loads((folder/'status.json').read_text()) if (folder/'status.json').exists() else {}
         env=json.loads((folder/'environment.json').read_text()) if (folder/'environment.json').exists() else {}
         raw=json.loads((folder/'raw.json').read_text()) if (folder/'raw.json').exists() else {'rounds':[]}
         platforms=sorted({r['platform_id'] for r in raw['rounds'] if r.get('platform_id')})
-        complete=status.get('outcome')=='success' and bool(raw['rounds']) and bool(env) and (folder/'assessment.md').exists()
-        if suite=='compare': complete=complete and (folder/'verdicts.json').exists() and len(platforms)==1
+        classification_path=folder/'result-classification.json'
+        classification=json.loads(classification_path.read_text()) if classification_path.exists() else {}
+        semantic=classification.get('status')
+        environmental=semantic=='inconclusive_environment'
+        complete=(status.get('outcome')=='success' and (bool(raw['rounds']) or environmental)
+                  and bool(env) and (folder/'assessment.md').exists())
+        if suite=='compare':
+            complete=(complete and (folder/'verdicts.json').exists()
+                      and (len(platforms)==1 or (environmental and not platforms)))
+        if semantic in ('measurement_failure','failure'):
+            complete=False
         entry=dict(shard=shard,outcome=status.get('outcome','missing'),complete=complete,
-                   platforms=platforms,git_sha=env.get('git_sha'),rounds=len(raw['rounds']),
-                   artifact=folder.name)
+                   verification=semantic or 'unknown',
+                   platforms=platforms,git_sha=env.get('git_sha'),
+                   rounds=len(raw['rounds']),artifact=folder.name)
         shards.append(entry)
-        lines += ['## '+shard,'',f"Artifact: `{folder.name}`. Benchmark step outcome: **{entry['outcome']}**. Complete diagnostics: **{complete}**. Platforms: `{', '.join(platforms) or 'unknown'}`.",'']
-        if (folder/'assessment.md').exists():
-            # Embed independently computed results; do not concatenate raw rounds and re-rank.
-            content=(folder/'assessment.md').read_text()
-            lines += [content.replace('# Benchmark assessment','### Shard assessment',1)]
-        else: lines += ['No assessment artifact received; inspect the shard job log.','']
+        rows=[{**r,'invalid_reasons':report.validate(r),
+               'load_failure_reasons':report.load_failures(r)} for r in raw['rounds']]
+        plan_path=folder/'campaign-plan.json'
+        plan=json.loads(plan_path.read_text()) if plan_path.exists() else {}
+        verdict_path=folder/'verdicts.json'
+        verdict=json.loads(verdict_path.read_text()) if verdict_path.exists() else verdicts.analyze(rows)
+        outcome=semantic or ('completed' if complete else 'measurement_failure')
+        if not semantic and complete and any(r['invalid_reasons'] and r.get('variant') not in highlights.CORE for r in rows):
+            outcome='completed_with_peer_exclusions'
+        sections += ['## '+shard.capitalize(), '',
+                     highlights.concise(rows,verdict,outcome,plan.get('issues',[]),
+                                        recoveries=plan.get('environment_recoveries',[]),
+                                        unresolved=plan.get('environment_unresolved',[])),
+                     'Artifact: `'+folder.name+'`.']
     shas={s['git_sha'] for s in shards if s['git_sha']}
     success=all(s['complete'] for s in shards) and len(shas)==1
-    lines.insert(2,'Artifact completeness: **'+('complete' if success else 'incomplete / failed')+'**. This status does not imply a performance winner.')
+    incomplete_evidence=any(x['verification']=='inconclusive_environment' for x in shards)
+    status=('Incomplete — inspect failing shard' if not success else
+            'Inconclusive — one or more runner-limited shards' if incomplete_evidence else
+            'Complete with warnings' if any(x['verification'] in ('completed_with_environment_limits','completed_with_peer_exclusions') for x in shards)
+            else 'Complete')
+    lines=['# Benchmark results','',f'**Run status:** {status}.',
+           'Measurements from different hosted runners are **not combined or ranked**.',
+           'Successful execution does not imply a performance winner or maximum throughput.',
+           '']+sections
     return dict(suite=suite,complete=success,shards=shards), '\n'.join(lines)+'\n'
-
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)

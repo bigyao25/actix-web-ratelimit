@@ -152,7 +152,6 @@ symlinked paths. This tool never invokes global prune, removes unrelated images,
 or deletes shared Cargo data. Temporary source archives and logs from manual
 investigations under the host temporary directory may be reclaimed separately.
 
-
 ## Capacity exploration and workflow results
 
 A fixed-rate test is useful before saturation: it measures correctness and the
@@ -208,7 +207,6 @@ python3 benchmarks/summary.py benchmarks/results/<run> --status completed --outp
 Runner architecture, quotas and platform identifiers must match before comparing
 runs; local Apple Silicon results cannot rank against shared x64 Runner numbers.
 
-
 ## High-load comparative benchmarks (manual only)
 
 Select **Actions → High-load Benchmarks → Run workflow → suite: compare**. This is the default
@@ -251,6 +249,13 @@ SUT quota throttling. OOM, Redis OOM, malformed responses, scheduler drops,
 transport failures and asserted quota violations still invalidate measurement quality.
 Schema-3 capacity-only drops fail load qualification and are excluded from matched cost ratios; they do not invalidate measurement quality.
 Generator pressure prevents attributing an observed ceiling to the server.
+Before the probe phase, the campaign runs up to two short baseline-only probes at
+the top of the default ladder. If the generator reaches 70% of its own CPU quota
+or misses scheduled arrivals, the whole ladder is scaled down so the top rate
+lands at that headroom; the decision is recorded as `calibration` in
+`campaign-plan.json`. Explicit `--probe-rates` are never rescaled. A saturated
+generator is a harness limit, so it must not consume the campaign or be reported
+as a server ceiling.
 
 The assessment's **High-load benchmark qualification** table requires five valid repeats of at least 30 seconds,
 >=99% completion of offered rate, scheduled p99 <=10 ms, and generator CPU below
@@ -264,7 +269,6 @@ labels and nominal over-admission remain visible. Different policies may be
 compared as end-to-end products but do not become equivalent algorithms. A winner
 is not manufactured from differing accepted-request counts or generator overload.
 Old Actix 4.11 results must be rebaselined after the common HTTP stack update.
-
 
 ## Connection reliability and schema 3
 
@@ -306,7 +310,6 @@ post-write EOF without replay, chunked framing and bounded error examples.
 This addresses a source-identified failure mode; a clean local run does not prove
 that every error from a previous GitHub run had the same cause.
 
-
 ## Interpreting the connection regression
 
 The four 20-second, 10k RPS baseline/HEAD Memory/Redis cells validate the revised
@@ -329,7 +332,6 @@ candidate levels with >=5 repetitions and phase-aligned resource samples. Memory
 and Redis need independent rate ladders; the same coarse levels need not bracket
 both boundaries. A clean committed source tree and matched environment are required
 for formal comparative conclusions.
-
 
 ## Faster runs without weakening the assertions
 

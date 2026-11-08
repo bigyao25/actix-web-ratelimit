@@ -31,7 +31,6 @@ Five repetitions of baseline and HEAD on both all-allow and all-deny Memory
 workloads completed: 20 short rounds, zero invalid rounds. This validates ordering
 and repeated-result aggregation; it is not a long-duration performance baseline.
 
-
 ## Measurement reliability follow-up
 
 Schema 2 adds full-window RPS timing, real request overlap, scheduled/dispatch
@@ -62,7 +61,6 @@ These 2-second probes did not demonstrate a capacity boundary. No maximum-RPS
 claim follows. Job-summary generation was exercised with a local
 GITHUB_STEP_SUMMARY file; GitHub-hosted workflow execution/upload has not been run.
 
-
 ## Competitor expansion (not yet container-verified)
 
 Added actix-trypema =0.1.2/core =2.2.1 and actix-extensible-rate-limit =0.4.0
@@ -79,7 +77,6 @@ benchmark ran and no newly measured competitor differences are claimed. Existing
 to this updated common HTTP stack. Workflow dispatch now offers the bounded
 behavior suite; manually dispatched CI smoke adds both new competitors. The
 benchmark workflow has no automatic push or pull-request trigger.
-
 
 ## High-load comparison revision
 
@@ -100,7 +97,6 @@ In high-load comparison, intentional SUT CPU-quota throttling is retained as a p
 solely an invalidity reason. Request loss, protocol/transport errors, OOM and
 asserted quota errors still invalidate. Qualification is scoped to matching
 backend/client/concurrency/mode and tested rates; generator pressure blocks it.
-
 
 ## Connection lifecycle and reporting regression
 
@@ -270,3 +266,39 @@ crate sources/dependencies and normal CI are unchanged. No rlbench containers or
 networks remained; ignored results and reusable images/caches remain. No remote
 long run, commit, push or workflow dispatch was performed. Actual stable capacity
 intervals still require the manual long campaign on the target runner.
+
+## Generator calibration after run 42109644774
+
+The manual `compare` run on `f8408fc9` failed in the Memory shard and produced no
+confirmed bound in the Redis shard. Both outcomes trace to the harness, not to the
+limiter implementations.
+
+- Memory aborted after six rounds. `baseline` at 60k RPS recorded loadgen CPU
+  198.2% of a 200% quota, dispatch p99 100.7 ms, 8,918 late drops and 5,950
+  capacity drops, so `report.validate` returned `scheduler_drops` and
+  `invalid_comparison_baseline` stopped the campaign. The generator was CPU-bound,
+  not cgroup-throttled (1,253 us of throttling over 5 s). The 45k probe had already
+  consumed 78.6% of the same quota, leaving no headroom for the next step.
+- Redis completed 232 clean rounds but confirmed no upper bound. 16k passed for
+  every variant; at 31k `baseline` passed 5/5 while `head` passed 3/5,
+  `extensible` 1/5 and `trypema` 0/5, all failing on the 512-slot in-flight cap
+  rather than server CPU. Mixed outcomes cannot form a bracket, and the 2,000 RPS
+  resolution budget was exhausted.
+
+Changes: `capacity.ladder_step` scales the default ladder down when the generator
+reaches 70% of its own quota or misses scheduled arrivals, `campaign.py` runs up to
+two short baseline-only calibration probes before the probe phase and records the
+decision as `calibration` in `campaign-plan.json`, and `bench.py` prints one
+diagnostic line per round plus an explicit generator-pressure warning. Explicit
+`--probe-rates` are never rescaled.
+
+Verification: seventy-four Python tooling tests pass. Replaying the recorded 60k
+round through `ladder_step` yields `[30000, 40000]`.
+
+The first remote attempt (run 42138981032) confirmed the calibration itself: the
+60k probe recorded 196.6% of a 200% quota with 16,922 late drops, the ladder
+scaled to 39k, and the 39k probe recorded 145.8% with no late drops. That attempt
+then failed because the calibration phase selected only `baseline`, so the main
+probe phase could not reuse the manifest for the unbuilt peer images. The
+calibration phase now selects every peer, which builds all images while only
+baseline rows drive the ladder decision.

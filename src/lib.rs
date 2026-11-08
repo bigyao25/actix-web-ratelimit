@@ -42,6 +42,7 @@
 
 pub mod config;
 mod headers;
+pub mod observability;
 pub mod store;
 
 // Compile both READMEs as doctests so their public API examples cannot silently drift.
@@ -70,6 +71,7 @@ use std::{
 use crate::{
     config::{ConfigError, RateLimitConfig},
     headers::ResponseHeaders,
+    observability::RateLimitObserver,
     store::{RateLimitDecision, RateLimitStore},
 };
 
@@ -80,6 +82,7 @@ where
     store: Arc<S>,
     config: Arc<RateLimitConfig>,
     response_headers: bool,
+    observer: Option<Arc<observability::ObserverState>>,
 }
 
 impl<S> RateLimit<S>
@@ -99,6 +102,7 @@ where
             store: Arc::new(store),
             config: Arc::new(config),
             response_headers: false,
+            observer: None,
         })
     }
 
@@ -129,6 +133,27 @@ where
         self.response_headers = enabled;
         self
     }
+
+    /// Registers a shared, synchronous observer; independent of response headers.
+    /// No extra clock samples or events are created unless registered. Checks
+    /// still execute exactly once. See [`RateLimitObserver`] for callback safety,
+    /// non-blocking requirements and panic isolation limits.
+    ///
+    /// ```
+    /// use actix_web_ratelimit::{RateLimit, config::RateLimitConfig,
+    ///     store::MemoryStore, observability::RateLimitEvent};
+    /// use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+    /// let count = Arc::new(AtomicU64::new(0));
+    /// let events = count.clone();
+    /// let middleware = RateLimit::new(RateLimitConfig::default(), MemoryStore::new())
+    ///     .observe(move |_: &RateLimitEvent<'_>| {
+    ///         events.fetch_add(1, Ordering::Relaxed);
+    ///     });
+    /// ```
+    pub fn observe(mut self, observer: impl RateLimitObserver + 'static) -> Self {
+        self.observer = Some(Arc::new(observability::ObserverState::new(observer)));
+        self
+    }
 }
 
 impl<S, B, ST> Transform<S, ServiceRequest> for RateLimit<ST>
@@ -147,7 +172,13 @@ where
     fn new_transform(&self, service: S) -> Self::Future {
         ok(RateLimitMiddleware {
             service: Rc::new(service),
-            store: self.store.clone(),
+            store: match &self.observer {
+                Some(observer) => Arc::new(observability::ObservedStore {
+                    store: self.store.clone(),
+                    observer: observer.clone(),
+                }),
+                None => self.store.clone(),
+            },
             config: self.config.clone(),
             response_headers: self
                 .response_headers
