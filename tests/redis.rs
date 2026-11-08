@@ -439,3 +439,113 @@ async fn redis_precision_and_maximum_numeric_configuration_are_safe() {
     })
     .await;
 }
+
+#[actix_web::test]
+#[ignore = "requires Redis"]
+async fn detailed_checks_share_atomic_state_with_basic_checks_and_report_real_failures() {
+    for policy in [FailurePolicy::FailClosed, FailurePolicy::FailOpen] {
+        with_fixture(policy, move |f| {
+            Box::pin(async move {
+                let config = RateLimitConfig::default().max_requests(3).window_secs(60);
+                assert!(!f.store.is_limited("a", &config).await.unwrap());
+                let admitted = f.store.check("a", &config).await.unwrap();
+                assert!(admitted.allowed);
+                assert_eq!(admitted.metadata.unwrap().remaining, 1);
+                assert_eq!(admitted.metadata.unwrap().retry_after, None);
+                assert!(!f.store.is_limited("a", &config).await.unwrap());
+                let denied = f.store.check("a", &config).await.unwrap();
+                assert!(!denied.allowed);
+                assert_eq!(denied.metadata.unwrap().remaining, 0);
+                assert!(denied.metadata.unwrap().retry_after.unwrap() <= Duration::from_secs(60));
+                let key = f.key("a", &config);
+                let count: usize = redis::cmd("ZCARD")
+                    .arg(&key)
+                    .query_async(&mut f.connection)
+                    .await
+                    .unwrap();
+                assert_eq!(count, 3);
+                let wrong_key = f.key("wrong-type", &config);
+                redis::cmd("SET")
+                    .arg(&wrong_key)
+                    .arg("bad")
+                    .query_async::<()>(&mut f.connection)
+                    .await
+                    .unwrap();
+                let result = f.store.check("wrong-type", &config).await;
+                match policy {
+                    FailurePolicy::FailOpen => {
+                        let decision = result.unwrap();
+                        assert!(decision.allowed);
+                        assert_eq!(decision.metadata, None);
+                    }
+                    FailurePolicy::FailClosed => assert!(result.is_err()),
+                }
+            })
+        })
+        .await;
+    }
+}
+
+#[actix_web::test]
+#[ignore = "requires Redis"]
+async fn concurrent_detailed_checks_return_unique_post_admission_quotas() {
+    with_fixture(FailurePolicy::FailClosed, move |f| {
+        Box::pin(async move {
+            let config = RateLimitConfig::default().max_requests(37);
+            let results = join_all((0..256).map(|_| f.store.check("shared", &config))).await;
+            let mut remaining = Vec::new();
+            for decision in results {
+                let decision = decision.unwrap();
+                let metadata = decision.metadata.unwrap();
+                if decision.allowed {
+                    remaining.push(metadata.remaining);
+                    assert_eq!(metadata.retry_after, None);
+                } else {
+                    assert_eq!(metadata.remaining, 0);
+                    assert!(metadata.retry_after.is_some());
+                }
+            }
+            remaining.sort_unstable();
+            assert_eq!(remaining, (0..37).collect::<Vec<_>>());
+        })
+    })
+    .await;
+}
+
+#[actix_web::test]
+#[ignore = "requires Redis"]
+async fn lua_metadata_uses_oldest_expiration_and_accounts_for_clock_rollback() {
+    with_fixture(FailurePolicy::FailClosed, move |f| {
+        Box::pin(async move {
+            let source = include_str!("../src/store/sliding_window.lua").replace(
+                "local time = redis.call(\"TIME\")",
+                "local time = { ARGV[4], ARGV[5] }",
+            );
+            let script = redis::Script::new(&source);
+            let key = format!("{}detailed-clock", f.prefix);
+            // Window=60s, quota=2. Rejections do not renew TTL or record timestamps.
+            for (seconds, micros, expected) in [
+                (100, 0, (0_u8, 1_usize, 0_u64)),
+                (130, 0, (0, 0, 0)),
+                (159, 250_000, (1, 0, 750_000)),
+                (160, 0, (0, 0, 0)),
+                (160, 0, (1, 0, 30_000_000)),
+                (150, 0, (1, 0, 40_000_000)),
+                (190, 0, (0, 0, 0)),
+            ] {
+                let result: (u8, usize, u64) = script
+                    .key(&key)
+                    .arg(60_000_000)
+                    .arg(2)
+                    .arg("details")
+                    .arg(seconds)
+                    .arg(micros)
+                    .invoke_async(&mut f.connection)
+                    .await
+                    .unwrap();
+                assert_eq!(result, expected);
+            }
+        })
+    })
+    .await;
+}

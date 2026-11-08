@@ -24,6 +24,7 @@ enum Scenario {
     RejectScript,
     NoScriptOnce,
     InvalidResult,
+    Metadata(&'static [u8]),
     DelayedResult,
     DropFirstCheck,
 }
@@ -106,11 +107,13 @@ impl Server {
                                         match scenario {
                                             Scenario::NoScriptOnce if check == 0 => b"-NOSCRIPT cache entry missing\r\n",
                                             Scenario::InvalidResult => b"$4\r\noops\r\n",
+                                            Scenario::Metadata(reply) => reply,
                                             Scenario::DelayedResult if check == 0 => {
                                                 tokio::time::sleep(Duration::from_millis(150)).await;
                                                 b":1\r\n"
                                             },
                                             Scenario::DropFirstCheck if check == 0 => break,
+                                            _ if args.last().is_some_and(|arg| arg == b"details") => b"*3\r\n:0\r\n:9\r\n:0\r\n",
                                             _ => b":0\r\n",
                                         }
                                     },
@@ -248,4 +251,99 @@ async fn zero_quotas_and_invalid_configurations_never_send_admission_commands() 
             .is_err()
     );
     assert_eq!(server.counters.checks.load(Ordering::SeqCst), 0);
+    let decision = store
+        .check("a", &RateLimitConfig::default().max_requests(0))
+        .await
+        .unwrap();
+    assert!(!decision.allowed);
+    assert_eq!(decision.metadata.unwrap().remaining, 0);
+    assert_eq!(decision.metadata.unwrap().retry_after, None);
+    assert!(
+        store
+            .check("a", &RateLimitConfig::default().window_secs(0))
+            .await
+            .is_err()
+    );
+    assert_eq!(server.counters.checks.load(Ordering::SeqCst), 0);
+}
+
+#[actix_web::test]
+async fn detailed_checks_use_one_command_and_recover_from_noscript() {
+    for scenario in [Scenario::Healthy, Scenario::NoScriptOnce] {
+        let server = Server::start(scenario).await;
+        let store = server
+            .store(FailurePolicy::FailClosed, Duration::from_secs(1))
+            .await;
+        let decision = store.check("a", &RateLimitConfig::default()).await.unwrap();
+        assert!(decision.allowed);
+        assert_eq!(decision.metadata.unwrap().remaining, 9);
+        assert_eq!(decision.metadata.unwrap().retry_after, None);
+        let expected = if matches!(scenario, Scenario::NoScriptOnce) {
+            2
+        } else {
+            1
+        };
+        assert_eq!(server.counters.checks.load(Ordering::SeqCst), expected);
+        assert_eq!(server.counters.loads.load(Ordering::SeqCst), expected);
+    }
+}
+
+#[actix_web::test]
+async fn detailed_rejections_decode_microsecond_delays() {
+    let server = Server::start(Scenario::Metadata(b"*3\r\n:1\r\n:0\r\n:750000\r\n")).await;
+    let store = server
+        .store(FailurePolicy::FailClosed, Duration::from_secs(1))
+        .await;
+    let decision = store.check("a", &RateLimitConfig::default()).await.unwrap();
+    assert!(!decision.allowed);
+    assert_eq!(decision.metadata.unwrap().remaining, 0);
+    assert_eq!(
+        decision.metadata.unwrap().retry_after,
+        Some(Duration::from_millis(750))
+    );
+}
+
+#[actix_web::test]
+async fn malformed_metadata_follows_failure_policy_without_fabricating_quota() {
+    for reply in [
+        b":0\r\n".as_slice(),
+        b"*2\r\n:0\r\n:9\r\n",
+        b"*3\r\n:0\r\n:10\r\n:0\r\n",
+        b"*3\r\n:0\r\n:-1\r\n:0\r\n",
+        b"*3\r\n:0\r\n:9\r\n:1\r\n",
+        b"*3\r\n:1\r\n:1\r\n:1\r\n",
+        b"*3\r\n:1\r\n:0\r\n:0\r\n",
+        b"*3\r\n:2\r\n:0\r\n:1\r\n",
+    ] {
+        for policy in [FailurePolicy::FailOpen, FailurePolicy::FailClosed] {
+            let server = Server::start(Scenario::Metadata(reply)).await;
+            let store = server.store(policy, Duration::from_secs(1)).await;
+            let result = store.check("a", &RateLimitConfig::default()).await;
+            match policy {
+                FailurePolicy::FailOpen => {
+                    let decision = result.unwrap();
+                    assert!(decision.allowed);
+                    assert_eq!(decision.metadata, None);
+                }
+                FailurePolicy::FailClosed => assert!(result.is_err()),
+            }
+        }
+    }
+}
+
+#[actix_web::test]
+async fn detailed_timeouts_keep_fail_open_and_fail_closed_semantics() {
+    for policy in [FailurePolicy::FailOpen, FailurePolicy::FailClosed] {
+        let server = Server::start(Scenario::DelayedResult).await;
+        let store = server.store(policy, Duration::from_millis(50)).await;
+        let result = store.check("a", &RateLimitConfig::default()).await;
+        match policy {
+            FailurePolicy::FailOpen => {
+                let decision = result.unwrap();
+                assert!(decision.allowed);
+                assert_eq!(decision.metadata, None);
+            }
+            FailurePolicy::FailClosed => assert!(result.is_err()),
+        }
+    }
 }

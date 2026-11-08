@@ -41,6 +41,7 @@
 //! failure policies, testing commands and custom store implementations.
 
 pub mod config;
+mod headers;
 pub mod store;
 
 // Compile both READMEs as doctests so their public API examples cannot silently drift.
@@ -68,7 +69,8 @@ use std::{
 
 use crate::{
     config::{ConfigError, RateLimitConfig},
-    store::RateLimitStore,
+    headers::ResponseHeaders,
+    store::{RateLimitDecision, RateLimitStore},
 };
 
 pub struct RateLimit<S>
@@ -77,6 +79,7 @@ where
 {
     store: Arc<S>,
     config: Arc<RateLimitConfig>,
+    response_headers: bool,
 }
 
 impl<S> RateLimit<S>
@@ -95,7 +98,36 @@ where
         Ok(Self {
             store: Arc::new(store),
             config: Arc::new(config),
+            response_headers: false,
         })
+    }
+
+    /// Opts into quota response headers (disabled by default).
+    ///
+    /// Disabled middleware calls only [`RateLimitStore::is_limited`], without
+    /// metadata lookup or header formatting. Enabled middleware calls only
+    /// [`RateLimitStore::check`], exactly once per request. Missing metadata (including
+    /// legacy stores and Redis fail-open) omits all automatic quota response fields.
+    ///
+    /// Reliable metadata produces `RateLimit-Policy` and `RateLimit` on admitted and
+    /// rejected responses, following [draft-ietf-httpapi-ratelimit-headers-11], which
+    /// is not a finalized RFC. The optional `t` parameter is omitted. The policy name
+    /// uses the namespace with quotes and backslashes escaped. Non-ASCII/control
+    /// characters or quotas above the Structured Fields integer maximum
+    /// (`999999999999999`) omit both draft fields, without changing admission or
+    /// `Retry-After`. Fractional-second windows omit the optional `w` parameter.
+    ///
+    /// Our HTTP 429 rejections include `Retry-After` when a delay is known, rounded
+    /// up to seconds. Built-in stores use the oldest active request's expiration,
+    /// rather than the full window. A zero quota has no finite recovery time and
+    /// omits this field. Other callback statuses and downstream HTTP 429 responses
+    /// do not receive an automatic `Retry-After`. Existing response fields are
+    /// preserved individually, and downstream service errors propagate unchanged.
+    ///
+    /// [draft-ietf-httpapi-ratelimit-headers-11]: https://datatracker.ietf.org/doc/html/draft-ietf-httpapi-ratelimit-headers-11
+    pub fn response_headers(mut self, enabled: bool) -> Self {
+        self.response_headers = enabled;
+        self
     }
 }
 
@@ -117,6 +149,9 @@ where
             service: Rc::new(service),
             store: self.store.clone(),
             config: self.config.clone(),
+            response_headers: self
+                .response_headers
+                .then(|| Arc::new(ResponseHeaders::new(&self.config))),
         })
     }
 }
@@ -125,6 +160,7 @@ pub struct RateLimitMiddleware<S> {
     service: Rc<S>,
     store: Arc<dyn RateLimitStore>,
     config: Arc<RateLimitConfig>,
+    response_headers: Option<Arc<ResponseHeaders>>,
 }
 
 impl<S, B> Service<ServiceRequest> for RateLimitMiddleware<S>
@@ -145,11 +181,30 @@ where
         let store = self.store.clone();
         let config = self.config.clone();
         let service = self.service.clone();
+        let response_headers = self.response_headers.clone();
         Box::pin(async move {
             let id = (config.get_id)(&req);
-            match store.is_limited(&id, &config).await {
-                Ok(true) => {
-                    let response = (config.on_exceed)(&id, &config, &req);
+            let result = if response_headers.is_some() {
+                store.check(&id, &config).await
+            } else {
+                store
+                    .is_limited(&id, &config)
+                    .await
+                    .map(|limited| RateLimitDecision {
+                        allowed: !limited,
+                        metadata: None,
+                    })
+            };
+            let metadata = match result {
+                Ok(decision) if !decision.allowed => {
+                    let mut response = (config.on_exceed)(&id, &config, &req);
+                    if let Some(headers) = &response_headers
+                        && let Some(metadata) = decision.metadata
+                    {
+                        let rejected_with_429 =
+                            response.status() == actix_web::http::StatusCode::TOO_MANY_REQUESTS;
+                        headers.apply(response.headers_mut(), metadata, rejected_with_429);
+                    }
                     return Ok(req.into_response(response).map_into_right_body());
                 }
                 Err(_) => {
@@ -160,9 +215,14 @@ where
                         )
                         .map_into_right_body());
                 }
-                Ok(false) => {}
+                Ok(decision) => decision.metadata,
+            };
+            let mut res = service.call(req).await?;
+            if let Some(headers) = &response_headers
+                && let Some(metadata) = metadata
+            {
+                headers.apply(res.headers_mut(), metadata, false);
             }
-            let res = service.call(req).await?;
             Ok(res.map_into_left_body())
         })
     }

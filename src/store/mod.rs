@@ -6,4 +6,4 @@ mod traits;
 pub use memory_store::MemoryStore;
 #[cfg(feature = "redis")]
 pub use redis_store::{FailurePolicy, RedisStore, RedisStoreOptions};
-pub use traits::{RateLimitStore, StoreError};
+pub use traits::{RateLimitDecision, RateLimitMetadata, RateLimitStore, StoreError};
