@@ -86,7 +86,7 @@ jobs:
       - name: Upload reports and raw diagnostics
         id: artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: benchmark-diagnostics-${{ matrix.shard }}
           path: benchmarks/results/ci/
@@ -120,7 +120,7 @@ jobs:
         run: python3 benchmarks/workflow.py aggregate benchmarks/results/shards --suite "$BENCHMARK_SUITE" --output benchmarks/results/overview --github-summary
       - name: Upload workflow overview
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: benchmark-overview
           path: benchmarks/results/overview/
