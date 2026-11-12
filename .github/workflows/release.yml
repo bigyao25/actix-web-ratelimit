@@ -95,7 +95,7 @@ jobs:
       contents: write
     steps:
       - name: Create version tag
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
           RELEASE_VERSION: ${{ inputs.version }}
         with:
@@ -116,7 +116,7 @@ jobs:
               });
             }
       - name: Create GitHub Release
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
           RELEASE_VERSION: ${{ inputs.version }}
         with:
